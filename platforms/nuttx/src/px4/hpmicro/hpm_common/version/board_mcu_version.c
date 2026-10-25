@@ -39,6 +39,7 @@
 
 #include <px4_platform_common/px4_config.h>
 #include <px4_platform_common/defines.h>
+#include <px4_platform_common/log.h>
 #include <px4_arch/romapi.h>
 
 int board_mcu_version(char *rev, const char **revstr, const char **errata)
@@ -65,7 +66,20 @@ int board_mcu_version(char *rev, const char **revstr, const char **errata)
 		*rev = '2';
 		*errata = NULL;
 		return 2;
+	} else if (chip_id == 0x10206141){
+		*revstr = "HPM6E80IVM1";
+		*rev = '1';
+		if (errata) {
+			*errata = NULL;
+		}
+		return 1;
 	}
+
+	/* Report the raw OTP chip ID for parts that are not listed above, so the
+	 * mapping can be extended without guessing.
+	 */
+
+	PX4_INFO("HPM OTP chip id 0x%08x is not known", chip_id);
 
 	return -1;
 }
