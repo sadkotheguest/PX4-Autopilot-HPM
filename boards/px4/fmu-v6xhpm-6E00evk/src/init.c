@@ -56,6 +56,7 @@
 #include <nuttx/config.h>
 #include <nuttx/board.h>
 #include <nuttx/spi/spi.h>
+#include <nuttx/spi/slave.h>
 #include <nuttx/sdio.h>
 #include <nuttx/mmcsd.h>
 #include <nuttx/analog/adc.h>
@@ -245,8 +246,14 @@ hpm_boardinitialize(void)
 
 /* I2C: the bus initialisers come from the NuttX HPM I2C master driver, and
  * the board pads are configured by hpm_i2cbus_pins_init() in i2c.cpp.
- * SPI is not ported to HPM6E00 yet - see bringup_stubs.cpp.
+ * SPI: the master driver is in the NuttX HPM SPI driver, the SPI0 slave
+ * controller is registered here for the SPI7 <-> SPI0 loopback test.
  */
+
+#if defined(CONFIG_SPI_SLAVE_DRIVER) && defined(CONFIG_HPM_SPI0)
+extern struct spi_slave_ctrlr_s *hpm_spislave_ctrlr_initialize(int port);
+extern uint32_t board_init_spi_clock(SPI_Type *ptr);
+#endif
 
  __EXPORT int board_app_initialize(uintptr_t arg)
 {
@@ -263,6 +270,12 @@ hpm_boardinitialize(void)
 
 	/* SPI/I2C buses */
 	hpm_spiinitialize();
+
+#if defined(CONFIG_SPI_SLAVE_DRIVER) && defined(CONFIG_HPM_SPI0)
+	/* SPI0 slave: pads + clock + /dev/spislv0 (SPI7 <-> SPI0 loopback test) */
+	board_init_spi_clock(HPM_SPI0);
+	spi_slave_register(hpm_spislave_ctrlr_initialize(0), 0);
+#endif
 
 	px4_platform_configure();
 

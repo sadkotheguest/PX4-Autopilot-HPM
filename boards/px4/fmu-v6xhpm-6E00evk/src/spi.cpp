@@ -57,6 +57,14 @@
 void hpm_spibus_pins_init(int bus)
 {
 	switch (bus) {
+	case 0:
+#if defined(CONFIG_HPM_SPI0)
+		px4_arch_configgpio(GPIO_SPI0_SCK);
+		px4_arch_configgpio(GPIO_SPI0_MISO);
+		px4_arch_configgpio(GPIO_SPI0_MOSI);
+#endif
+		break;
+
 	case 7:
 #if defined(CONFIG_HPM_SPI7)
 		px4_arch_configgpio(GPIO_SPI7_SCK);
@@ -71,6 +79,12 @@ void hpm_spibus_pins_init(int bus)
 }
 
 constexpr px4_spi_bus_t px4_spi_buses[SPI_BUS_MAX_BUS_ITEMS] = {
+	/* SPI0 is used as the slave side of the SPI7 <-> SPI0 loopback test; it is
+	 * listed here so that hpm_spiinitialize() finds the bus, no devices attached.
+	 */
+	initSPIBus(SPI::Bus::SPI0, {
+	}),
+
 	initSPIBus(SPI::Bus::SPI7, {
 	}),
 };

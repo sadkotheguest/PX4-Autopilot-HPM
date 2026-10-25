@@ -1,0 +1,7 @@
+menuconfig SYSTEMCMDS_SPITEST
+	bool "spitest"
+	default n
+	---help---
+		SPI master/slave loopback test.  On the HPM6E00EVK it drives SPI7 as
+		master (PF26/PF29/PF28, CS on PF25) against SPI0 as slave
+		(PE10/PE13/PE12/PE11) and verifies both directions.
