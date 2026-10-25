@@ -36,28 +36,65 @@
  *
  * I2C bus configuration for the HPM6E00EVK (HPM6E80).
  *
- * The NuttX HPM I2C master driver (hpm_i2c_master.c) calls the board hook
- * hpm_i2cbus_pins_init() and board_init_i2c_clock() from
- * hpm_i2cbus_initialize(), so only the pads have to be described here.
+ * The pads are described by the GPIO_I2C*_SCL/SDA macros in board_config.h and
+ * configured with px4_arch_configgpio(), the same way the HPM6750 board does
+ * it.  The NuttX HPM I2C master driver calls hpm_i2cbus_pins_init() from
+ * hpm_i2cbus_initialize().
  *
- * HPM6E00EVK: the I2C device on the board is a CAT24C128 EEPROM (16 KiB,
- * address 0x50) wired to I2C1 on PA12 (SDA) / PA13 (SCL).  The HPM SDK ships
- * board_init_i2c_eeprom_pin() for exactly that pad pair; it is not declared
- * in the SDK board.h, so it is declared here.
+ * HPM6E00EVK: the only I2C device is the CAT24C128 EEPROM (16 KiB, address
+ * 0x50) on I2C1, wired to PA13 (SCL) / PA12 (SDA).
  */
 
+#include <px4_platform_common/px4_config.h>
 #include <px4_arch/i2c_hw_description.h>
 
 #if defined(CONFIG_I2C)
 
-extern "C" void board_init_i2c_eeprom_pin(void);
+/****************************************************************************
+ * Name: board_i2cbus_clear
+ *
+ * Description:
+ *   Clear an I2C bus by performing a recovery sequence. Toggles the clock
+ *   line up to 9 times while monitoring the SDA line to recover from a stuck
+ *   I2C slave device.
+ *
+ * Input Parameters:
+ *   gpio_sda  - GPIO pin for SDA (data line)
+ *   gpio_clk  - GPIO pin for SCL (clock line)
+ *
+ * Returned Value:
+ *   None
+ *
+ ****************************************************************************/
+
+void board_i2cbus_clear(uint32_t gpio_sda, uint32_t gpio_clk)
+{
+	px4_arch_configgpio(gpio_sda);
+	px4_arch_configgpio(gpio_clk);
+
+	for (uint32_t i = 0; i < 9; i++) {
+		px4_arch_gpiowrite(gpio_clk, 1);
+
+		for (uint32_t j = 0; j < 5000; j++) {
+			__asm__ volatile("nop");
+		}
+
+		px4_arch_gpiowrite(gpio_clk, 0);
+
+		for (uint32_t j = 0; j < 5000; j++) {
+			__asm__ volatile("nop");
+		}
+	}
+
+	px4_arch_unconfiggpio(gpio_sda);
+	px4_arch_unconfiggpio(gpio_clk);
+}
 
 /****************************************************************************
  * Name: hpm_i2cbus_pins_init
  *
  * Description:
- *   Configure the pads of the selected I2C port. Called by the NuttX HPM
- *   I2C master driver when the bus is opened the first time.
+ *   Initialize the selected I2C port pins
  *
  * Input Parameters:
  *   port - I2C port number
@@ -67,17 +104,22 @@ extern "C" void board_init_i2c_eeprom_pin(void);
  *
  ****************************************************************************/
 
-extern "C" int hpm_i2cbus_pins_init(int port)
+int hpm_i2cbus_pins_init(int port)
 {
 	switch (port) {
 	case 1:
-		/* I2C1: PA12 = SDA, PA13 = SCL (CAT24C128 EEPROM) */
-		board_init_i2c_eeprom_pin();
-		return 0;
+#if defined(CONFIG_HPM_I2C1)
+		board_i2cbus_clear(GPIO_I2C1_SDA_GPIO, GPIO_I2C1_SCL_GPIO);
+		px4_arch_configgpio(GPIO_I2C1_SCL);
+		px4_arch_configgpio(GPIO_I2C1_SDA);
+#endif
+		break;
 
 	default:
 		return -EINVAL;
 	}
+
+	return 0;
 }
 
 constexpr px4_i2c_bus_t px4_i2c_buses[I2C_BUS_MAX_BUS_ITEMS] = {
