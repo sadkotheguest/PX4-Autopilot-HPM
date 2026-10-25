@@ -56,6 +56,8 @@ static const px4_spi_bus_t *_spi_bus2;
 static const px4_spi_bus_t *_spi_bus3;
 static const px4_spi_bus_t *_spi_bus4;
 static const px4_spi_bus_t *_spi_bus5;
+static const px4_spi_bus_t *_spi_bus6;
+static const px4_spi_bus_t *_spi_bus7;
 
 
 static void spi_bus_configgpio_cs(const px4_spi_bus_t *bus)
@@ -87,6 +89,10 @@ __EXPORT void hpm_spiinitialize()
 		case 4: _spi_bus4 = &px4_spi_buses[i]; break;
 
 		case 5: _spi_bus5 = &px4_spi_buses[i]; break;
+
+		case 6: _spi_bus6 = &px4_spi_buses[i]; break;
+
+		case 7: _spi_bus7 = &px4_spi_buses[i]; break;
 		}
 	}
 
@@ -145,6 +151,15 @@ __EXPORT void hpm_spiinitialize()
 	}
 
 #endif // CONFIG_HPM_SPI5
+
+#ifdef CONFIG_HPM_SPI7
+	ASSERT(_spi_bus7);
+
+	if (board_has_bus(BOARD_SPI_BUS, 7)) {
+		spi_bus_configgpio_cs(_spi_bus7);
+	}
+
+#endif // CONFIG_HPM_SPI7
 
 }
 
@@ -310,6 +325,30 @@ __EXPORT uint8_t hpm_spi5status(FAR struct spi_dev_s *dev, uint32_t devid)
 	return SPI_STATUS_PRESENT;
 }
 #endif // CONFIG_HPM_SPI5
+
+/************************************************************************************
+ * Name: hpm_spi7select and hpm_spi7status
+ *
+ * Description:
+ *   Called by hpm spi driver on bus 7 (HPM6E00EVK).
+ *
+ ************************************************************************************/
+#ifdef CONFIG_HPM_SPI7
+__EXPORT void write_spi7_cs(uint32_t pin, uint8_t state)
+{
+	;
+}
+
+__EXPORT void hpm_spi7select(FAR struct spi_dev_s *dev, uint32_t devid, bool selected)
+{
+	hpm_spixselect(_spi_bus7, dev, devid, selected);
+}
+
+__EXPORT uint8_t hpm_spi7status(FAR struct spi_dev_s *dev, uint32_t devid)
+{
+	return SPI_STATUS_PRESENT;
+}
+#endif // CONFIG_HPM_SPI7
 
 
 void board_control_spi_sensors_power(bool enable_power, int bus_mask)

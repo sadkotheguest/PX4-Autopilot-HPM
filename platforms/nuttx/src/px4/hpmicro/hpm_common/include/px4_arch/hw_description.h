@@ -214,6 +214,8 @@ enum class Bus {
 	SPI3,
 	SPI4,
 	SPI5,
+	SPI6,
+	SPI7,
 };
 
 using CS = GPIO::GPIOPin; ///< chip-select pin

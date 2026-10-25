@@ -36,7 +36,7 @@ px4_add_library(drivers_board
 	bringup_stubs.cpp
 	i2c.cpp
 	mtd.cpp
-	#spi.cpp
+	spi.cpp
 	#timer_config.cpp
 	#usb.c
 	#sdhc.c
@@ -50,6 +50,7 @@ target_link_libraries(drivers_board
 	PRIVATE
 		#arch_board_hw_info
 		arch_board_romapi
+		arch_spi # hpm_spiinitialize
 		drivers__led # drv_led_start
 		nuttx_arch # sdio
 		nuttx_drivers # sdio

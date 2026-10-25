@@ -261,8 +261,8 @@ hpm_boardinitialize(void)
 	hpm_usbdev_initialize(CONFIG_HPM_USBDEV_INSTANCE);
 #endif
 
-	/* SPI/I2C are disabled in the minimal 6E00 bring-up image */
-	// hpm_spiinitialize();
+	/* SPI/I2C buses */
+	hpm_spiinitialize();
 
 	px4_platform_configure();
 
