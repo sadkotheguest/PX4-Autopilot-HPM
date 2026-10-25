@@ -39,6 +39,19 @@ set(px4_git_included true)
 
 #=============================================================================
 #
+#	Windows support: .sh files cannot be executed directly (there is no
+#	#!/bin/sh interpreter), so run helper scripts through bash when available.
+#
+#=============================================================================
+find_program(PX4_BASH_EXECUTABLE NAMES bash)
+if(PX4_BASH_EXECUTABLE)
+	set(PX4_CHECK_SUBMODULES ${PX4_BASH_EXECUTABLE} ${PX4_SOURCE_DIR}/Tools/check_submodules.sh)
+else()
+	set(PX4_CHECK_SUBMODULES ${PX4_SOURCE_DIR}/Tools/check_submodules.sh)
+endif()
+
+#=============================================================================
+#
 #	px4_add_git_submodule
 #
 #	This function add a git submodule target.
@@ -71,7 +84,7 @@ function(px4_add_git_submodule)
 	endif()
 
 	execute_process(
-		COMMAND Tools/check_submodules.sh ${REL_PATH}
+		COMMAND ${PX4_CHECK_SUBMODULES} ${REL_PATH}
 		WORKING_DIRECTORY ${PX4_SOURCE_DIR}
 		)
 
@@ -79,7 +92,7 @@ function(px4_add_git_submodule)
 	string(REPLACE "." "_" NAME ${NAME})
 
 	add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/git_init_${NAME}.stamp
-		COMMAND Tools/check_submodules.sh ${REL_PATH}
+		COMMAND ${PX4_CHECK_SUBMODULES} ${REL_PATH}
 		COMMAND ${CMAKE_COMMAND} -E touch ${CMAKE_CURRENT_BINARY_DIR}/git_init_${NAME}.stamp
 		DEPENDS ${PX4_SOURCE_DIR}/.gitmodules ${PATH}/.git
 		COMMENT "git submodule ${REL_PATH}"

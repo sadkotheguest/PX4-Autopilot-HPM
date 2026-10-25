@@ -42,6 +42,14 @@ foreach(f ${all_px4_src_files})
 	list(APPEND all_px4_src_files_relative "${relative_path}")
 endforeach(f)
 
+# Windows limits a command line to ~8k characters, which this list exceeds.
+# Hand the paths over in a file instead.
+set(events_src_list_file ${PX4_BINARY_DIR}/events_src_list.txt)
+file(WRITE ${events_src_list_file} "")
+foreach(f ${all_px4_src_files_relative})
+	file(APPEND ${events_src_list_file} "${f}\n")
+endforeach()
+
 set(generated_events_dir ${PX4_BINARY_DIR}/events)
 set(generated_events_px4_file ${generated_events_dir}/px4.json)
 set(generated_events_common_enums_file ${generated_events_dir}/common_with_enums.json)
@@ -49,10 +57,11 @@ add_custom_command(OUTPUT ${generated_events_px4_file}
 	COMMAND ${CMAKE_COMMAND} -E make_directory ${generated_events_dir}
 	COMMAND ${PYTHON_EXECUTABLE} ${PX4_SOURCE_DIR}/Tools/px_process_events.py
 		--base-path ${PX4_SOURCE_DIR}/src
-		--src-path ${all_px4_src_files_relative}
+		--src-list-file ${events_src_list_file}
 		--json ${generated_events_px4_file} #--verbose
 	DEPENDS
 		${all_px4_src_files}
+		${events_src_list_file}
 		${PX4_SOURCE_DIR}/Tools/px_process_events.py
 		${PX4_SOURCE_DIR}/Tools/px4events/jsonout.py
 		${PX4_SOURCE_DIR}/Tools/px4events/srcparser.py

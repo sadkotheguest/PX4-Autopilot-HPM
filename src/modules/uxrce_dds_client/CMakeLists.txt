@@ -37,7 +37,31 @@ if(${CMAKE_VERSION} VERSION_LESS_EQUAL "3.15")
 else()
 
 	set(microxrceddsclient_src_dir   ${CMAKE_CURRENT_SOURCE_DIR}/Micro-XRCE-DDS-Client)
-	set(microxrceddsclient_build_dir ${CMAKE_CURRENT_BINARY_DIR})
+	if(CMAKE_HOST_WIN32)
+		# Windows: the ExternalProject tree (including the nested microcdr
+		# SuperBuild) exceeds MAX_PATH and makes ninja fail recompaction, so
+		# keep it in a short per-board directory next to the source tree.
+		get_filename_component(_px4_parent_dir "${PX4_SOURCE_DIR}/.." ABSOLUTE)
+		set(microxrceddsclient_build_dir "${_px4_parent_dir}/xrce/${PX4_BOARD}")
+	else()
+		set(microxrceddsclient_build_dir ${CMAKE_CURRENT_BINARY_DIR})
+	endif()
+	file(MAKE_DIRECTORY "${microxrceddsclient_build_dir}")
+
+	# On Windows the Micro-XRCE SuperBuild reconfigures its own build directory
+	# while the outer ninja still holds .ninja_log, which makes "ninja -t
+	# recompact" fail with "Permission denied".  Use Makefiles for this
+	# ExternalProject instead; the generator is inherited by the nested
+	# microcdr/uclient projects.
+	set(microxrceddsclient_generator_args)
+	if(CMAKE_HOST_WIN32)
+		find_program(PX4_MAKE_PROGRAM NAMES make)
+		if(PX4_MAKE_PROGRAM)
+			list(APPEND microxrceddsclient_generator_args
+				CMAKE_GENERATOR "Unix Makefiles"
+				CMAKE_MAKE_PROGRAM "${PX4_MAKE_PROGRAM}")
+		endif()
+	endif()
 
 	px4_add_git_submodule(TARGET git_micro_xrce_dds_client PATH "${microxrceddsclient_src_dir}")
 
@@ -68,7 +92,8 @@ else()
 		libmicroxrceddsclient_project
 		PREFIX      ${microxrceddsclient_build_dir}
 		SOURCE_DIR  ${microxrceddsclient_src_dir}
-		INSTALL_DIR ${CMAKE_CURRENT_BINARY_DIR}
+		INSTALL_DIR ${microxrceddsclient_build_dir}
+		${microxrceddsclient_generator_args}
 		CMAKE_CACHE_ARGS
 			-DCMAKE_CXX_COMPILER:FILEPATH=${CMAKE_CXX_COMPILER}
 			-DCMAKE_C_COMPILER:FILEPATH=${CMAKE_C_COMPILER}
@@ -86,11 +111,11 @@ else()
 			-DUCLIENT_PROFILE_SHARED_MEMORY:BOOL=OFF
 			-DUCLIENT_PLATFORM_POSIX:BOOL=ON
 			-DUCLIENT_BUILD_MICROCDR:BOOL=ON
-			-DCMAKE_INSTALL_PREFIX:PATH=${CMAKE_CURRENT_BINARY_DIR}
-			-DCMAKE_PREFIX_PATH:PATH=${CMAKE_CURRENT_BINARY_DIR}
+			-DCMAKE_INSTALL_PREFIX:PATH=${microxrceddsclient_build_dir}
+			-DCMAKE_PREFIX_PATH:PATH=${microxrceddsclient_build_dir}
 			-DCMAKE_TOOLCHAIN_FILE:STRING=${microxrceddsclient_toolchain}
-		BUILD_BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/${lib_dir}/libmicroxrcedds_client.a
-		BUILD_BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/${lib_dir}/libmicrocdr.a
+		BUILD_BYPRODUCTS ${microxrceddsclient_build_dir}/${lib_dir}/libmicroxrcedds_client.a
+		BUILD_BYPRODUCTS ${microxrceddsclient_build_dir}/${lib_dir}/libmicrocdr.a
 		DEPENDS prebuild_targets git_micro_xrce_dds_client
 		LOG_CONFIGURE true
 		LOG_BUILD true
@@ -100,12 +125,12 @@ else()
 
 	add_library(libmicroxrceddsclient STATIC IMPORTED GLOBAL)
 	set_target_properties(libmicroxrceddsclient
-		PROPERTIES IMPORTED_LOCATION ${CMAKE_CURRENT_BINARY_DIR}/${lib_dir}/libmicroxrcedds_client.a
+		PROPERTIES IMPORTED_LOCATION ${microxrceddsclient_build_dir}/${lib_dir}/libmicroxrcedds_client.a
 	)
 
 	add_library(libmicrocdr STATIC IMPORTED GLOBAL)
 	set_target_properties(libmicrocdr
-		PROPERTIES IMPORTED_LOCATION ${CMAKE_CURRENT_BINARY_DIR}/${lib_dir}/libmicrocdr.a
+		PROPERTIES IMPORTED_LOCATION ${microxrceddsclient_build_dir}/${lib_dir}/libmicrocdr.a
 	)
 
 	add_library(microxrceddsclient INTERFACE)
@@ -113,7 +138,6 @@ else()
 	add_dependencies(microxrceddsclient libmicrocdr)
 	add_dependencies(microxrceddsclient libmicroxrceddsclient_project)
 	target_include_directories(microxrceddsclient INTERFACE ${microxrceddsclient_build_dir}/include)
-
 
 	add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/dds_topics.h
 		COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/generate_dds_topics.py

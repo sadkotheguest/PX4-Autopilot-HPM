@@ -51,7 +51,7 @@ def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Process events definitions.")
     parser.add_argument("-s", "--src-path",
-                        default=["../src"],
+                        default=None,
                         metavar="PATH",
                         nargs='*',
                         help="one or more paths/files to source files to scan for events")
@@ -59,6 +59,10 @@ def main():
                         default="",
                         metavar="PATH",
                         help="path prefix for everything passed with --src-path")
+    parser.add_argument("--src-list-file",
+                        default=None,
+                        metavar="FILENAME",
+                        help="file with one source path per line (Windows command line limit workaround)")
     parser.add_argument("-j", "--json",
                         nargs='?',
                         const="events.json",
@@ -87,7 +91,17 @@ def main():
 
     # canonicalize + remove duplicates
     src_paths = set()
-    for path in args.src_path:
+    if args.src_path is None:
+        # keep the historical default only when nothing else was requested
+        src_path_list = [] if args.src_list_file else ["../src"]
+    else:
+        src_path_list = list(args.src_path)
+
+    if args.src_list_file:
+        with open(args.src_list_file, 'r') as list_file:
+            src_path_list += [line.strip() for line in list_file if line.strip()]
+
+    for path in src_path_list:
         src_paths.add(os.path.realpath(os.path.join(args.base_path, path)))
 
     if not scanner.ScanDir(src_paths, parser):

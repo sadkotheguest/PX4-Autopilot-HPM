@@ -41,6 +41,12 @@ ifneq (, $(findstring CYGWIN, $(shell uname)))
   CONFIG_CYGWIN_WINTOOL := y
 endif
 
+# The NuttX arch Make.defs derive the ISA extensions (zicsr/zifencei) from the
+# compiler version.  It normally probes $(CC), but $(CC) is only defined further
+# down in this file, so provide the value up front from the CMake toolchain.
+GCCVER := $(shell ${CMAKE_C_COMPILER} --version 2>/dev/null | grep -o '[0-9]\+\.[0-9]\+' | head -1 | cut -d. -f1)
+export GCCVER
+
 include $(TOPDIR)/.config
 include $(TOPDIR)/tools/Config.mk
 

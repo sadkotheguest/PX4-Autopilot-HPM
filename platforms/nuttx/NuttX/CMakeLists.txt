@@ -34,6 +34,26 @@
 set(NUTTX_CONFIG_DIR ${PX4_BOARD_DIR}/nuttx-config)
 set(APPS_DIR ${NUTTX_SRC_DIR}/apps)
 
+# External NuttX tree: apps may live next to it (see init.cmake)
+if(DEFINED ENV{PX4_NUTTX_APPS_DIR})
+	set(APPS_DIR "$ENV{PX4_NUTTX_APPS_DIR}")
+endif()
+
+# On Windows ninja runs every command through cmd.exe, so POSIX shell features
+# used below (redirection, cat, find) only work if we invoke bash explicitly.
+find_program(PX4_BASH_EXECUTABLE NAMES bash)
+
+# GNU make (MSYS) treats a drive-letter colon in a prerequisite as a rule
+# separator ("multiple target patterns"), so hand it TOPDIR in POSIX form.
+if(CMAKE_HOST_WIN32)
+	string(SUBSTRING "${NUTTX_DIR}" 0 1 _nuttx_drive)
+	string(TOLOWER "${_nuttx_drive}" _nuttx_drive)
+	string(SUBSTRING "${NUTTX_DIR}" 2 -1 _nuttx_rest)
+	set(NUTTX_DIR_MAKE "/${_nuttx_drive}${_nuttx_rest}")
+else()
+	set(NUTTX_DIR_MAKE "${NUTTX_DIR}")
+endif()
+
 ###############################################################################
 # NuttX build
 ###############################################################################
@@ -55,9 +75,9 @@ endif()
 add_custom_command(
 	OUTPUT ${NUTTX_DIR}/.config
 	COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_BINARY_DIR}/nuttx/Make.defs ${NUTTX_DIR}/Make.defs
-	COMMAND cat ${NUTTX_DEFCONFIG} ${EXTRA_NUTTX_CONFIG_FILE} > ${NUTTX_DIR}/.config
+	COMMAND ${PX4_BASH_EXECUTABLE} -c "cat '${NUTTX_DEFCONFIG}' '${EXTRA_NUTTX_CONFIG_FILE}' > '${NUTTX_DIR}/.config'"
 	COMMAND ${CMAKE_COMMAND} -E copy_if_different ${NUTTX_DEFCONFIG} ${NUTTX_DIR}/defconfig
-	COMMAND ${NUTTX_SRC_DIR}/tools/px4_nuttx_make_olddefconfig.sh > ${CMAKE_CURRENT_BINARY_DIR}/nuttx_olddefconfig.log
+	COMMAND ${PX4_BASH_EXECUTABLE} -c "'${NUTTX_SRC_DIR}/tools/px4_nuttx_make_olddefconfig.sh' > '${CMAKE_CURRENT_BINARY_DIR}/nuttx_olddefconfig.log'"
 	COMMAND ${CMAKE_COMMAND} -E copy_if_different ${NUTTX_DIR}/.config ${CMAKE_CURRENT_BINARY_DIR}/nuttx/.config
 	DEPENDS
 		${NUTTX_DEFCONFIG}
@@ -74,7 +94,7 @@ add_custom_command(
 	COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_BINARY_DIR}/nuttx/.config ${NUTTX_DIR}/.config
 	COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_BINARY_DIR}/nuttx/Make.defs ${NUTTX_DIR}/Make.defs
 	COMMAND make --no-print-directory --silent clean_context
-	COMMAND make --no-print-directory --silent pass1dep > ${CMAKE_CURRENT_BINARY_DIR}/nuttx_context.log
+	COMMAND ${PX4_BASH_EXECUTABLE} -c "make --no-print-directory --silent pass1dep > '${CMAKE_CURRENT_BINARY_DIR}/nuttx_context.log'"
 	DEPENDS
 		${CMAKE_CURRENT_BINARY_DIR}/nuttx/Make.defs
 		${NUTTX_DIR}/.config
@@ -146,11 +166,11 @@ file(GLOB_RECURSE nuttx_apps_files LIST_DIRECTORIES false
 )
 add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/apps/libapps.a
 	COMMAND ${CMAKE_COMMAND} -E remove -f ${APPS_DIR}/libapps.a ${APPS_DIR}/builtin/builtin_list.h ${APPS_DIR}/builtin/builtin_proto.h
-	COMMAND find ${APPS_DIR} -type f -name \*.o -delete
+	COMMAND ${PX4_BASH_EXECUTABLE} -c "find '${APPS_DIR}' -type f -name '*.o' -delete"
 	COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_BINARY_DIR}/px4.bdat ${APPS_DIR}/builtin/registry/px4.bdat
 	COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_BINARY_DIR}/px4.pdat ${APPS_DIR}/builtin/registry/px4.pdat
 	COMMAND ${CMAKE_COMMAND} -E touch_nocreate ${APPS_DIR}/builtin/registry/.updated
-	COMMAND make --no-print-directory --silent TOPDIR="${NUTTX_DIR}" > ${CMAKE_CURRENT_BINARY_DIR}/nuttx_apps.log
+	COMMAND ${PX4_BASH_EXECUTABLE} -c "make --no-print-directory --silent TOPDIR='${NUTTX_DIR_MAKE}' > '${CMAKE_CURRENT_BINARY_DIR}/nuttx_apps.log'"
 	COMMAND ${CMAKE_COMMAND} -E copy_if_different ${APPS_DIR}/libapps.a ${CMAKE_CURRENT_BINARY_DIR}/apps/libapps.a
 	DEPENDS ${nuttx_apps_files} nuttx_context ${NUTTX_DIR}/include/nuttx/config.h
 	WORKING_DIRECTORY ${APPS_DIR}
@@ -176,8 +196,8 @@ function(add_nuttx_dir nuttx_lib nuttx_lib_dir kernel extra target)
 
 	add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/nuttx/${nuttx_lib_dir}/lib${nuttx_lib}.a
 		COMMAND ${CMAKE_COMMAND} -E remove -f ${NUTTX_DIR}/${nuttx_lib_dir}/lib${nuttx_lib}.a
-		COMMAND find ${nuttx_lib_dir} -type f -name \*.o -delete
-		COMMAND make -C ${nuttx_lib_dir} --no-print-directory --silent ${nuttx_lib_target} TOPDIR="${NUTTX_DIR}" KERNEL=${kernel} EXTRAFLAGS=${extra}
+		COMMAND ${PX4_BASH_EXECUTABLE} -c "find '${nuttx_lib_dir}' -type f -name '*.o' -delete"
+		COMMAND make -C ${nuttx_lib_dir} --no-print-directory --silent ${nuttx_lib_target} TOPDIR="${NUTTX_DIR_MAKE}" KERNEL=${kernel} EXTRAFLAGS=${extra}
 		COMMAND ${CMAKE_COMMAND} -E copy_if_different ${NUTTX_DIR}/${nuttx_lib_dir}/lib${nuttx_lib}.a ${CMAKE_CURRENT_BINARY_DIR}/nuttx/${nuttx_lib_dir}/lib${nuttx_lib}.a
 		DEPENDS
 			${nuttx_lib_files}

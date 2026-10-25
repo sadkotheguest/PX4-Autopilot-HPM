@@ -340,10 +340,17 @@ add_custom_command(
 	)
 
 if("${CONFIG_FS_CROMFS}" STREQUAL "y")
+	# MSYS gcc appends .exe to the output name, so address the binary accordingly
+	if(CMAKE_HOST_WIN32)
+		set(GENCROMFS_NAME gencromfs.exe)
+	else()
+		set(GENCROMFS_NAME gencromfs)
+	endif()
+
 	add_custom_command(
-		OUTPUT ${CMAKE_BINARY_DIR}/gencromfs
+		OUTPUT ${CMAKE_BINARY_DIR}/${GENCROMFS_NAME}
 		COMMAND make --no-print-directory --silent -f Makefile.host gencromfs
-		COMMAND ${CMAKE_COMMAND} -E copy_if_different gencromfs ${CMAKE_BINARY_DIR}/gencromfs
+		COMMAND ${CMAKE_COMMAND} -E copy_if_different ${GENCROMFS_NAME} ${CMAKE_BINARY_DIR}/${GENCROMFS_NAME}
 		DEPENDS ${PX4_SOURCE_DIR}/platforms/nuttx/NuttX/nuttx/tools/gencromfs.c
 		WORKING_DIRECTORY ${NUTTX_DIR}/tools
 	)
@@ -351,9 +358,9 @@ if("${CONFIG_FS_CROMFS}" STREQUAL "y")
 	# create nsh_romfsimg.c
 	add_custom_command(OUTPUT nsh_romfsimg.c
 		COMMAND ${CMAKE_COMMAND} -E remove -f nsh_romfsimg.c
-		COMMAND ${CMAKE_BINARY_DIR}/gencromfs ${romfs_gen_root_dir} nsh_romfsimg.c
+		COMMAND ${CMAKE_BINARY_DIR}/${GENCROMFS_NAME} ${romfs_gen_root_dir} nsh_romfsimg.c
 		DEPENDS
-			${CMAKE_BINARY_DIR}/gencromfs
+			${CMAKE_BINARY_DIR}/${GENCROMFS_NAME}
 			romfs_pruned.stamp
 		COMMENT "ROMFS: generating image"
 	)

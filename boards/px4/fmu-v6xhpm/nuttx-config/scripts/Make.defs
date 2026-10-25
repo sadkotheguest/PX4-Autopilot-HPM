@@ -26,6 +26,18 @@ CONFIG_XIP_FLASH_SIZE = 16M
 
 CFLAGS += -DFLASH_XIP -DUSE_I2C_DMA_MGR=1
 
+# GCC 12+ needs the _zicsr extension for csrr/csrw in start.S and irq.h.
+# PX4's CMake passes its own -march, so append the full ISA here (this file is
+# included at the end of NuttX's Make.defs).  Keep it in sync with the
+# CONFIG_ARCH_FPU/DPFPU selection: the ABI and the ISA string must match.
+ifeq ($(CONFIG_ARCH_DPFPU),y)
+CFLAGS += -march=rv32gc_zicsr_zifencei -mabi=ilp32d
+else ifeq ($(CONFIG_ARCH_FPU),y)
+CFLAGS += -march=rv32imafc_zicsr_zifencei -mabi=ilp32f
+else
+CFLAGS += -march=rv32imac_zicsr_zifencei
+endif
+
 # Add include directories
 CFLAGS += -I$(CHIP_DIR)$(DELIM)hpm_sdk$(DELIM)arch
 CFLAGS += -I$(CHIP_DIR)$(DELIM)hpm_sdk$(DELIM)arch$(DELIM)riscv$(DELIM)intc
