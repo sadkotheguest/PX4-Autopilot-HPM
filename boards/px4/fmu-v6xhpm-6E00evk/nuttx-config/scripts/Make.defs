@@ -26,6 +26,11 @@ CONFIG_XIP_FLASH_SIZE = 16M
 
 CFLAGS += -DFLASH_XIP=1
 
+# The HPM SDK build system selects the DMAv2 driver/register set with this
+# macro (hpm_i2c.h, hpm_spi.h: "#ifdef HPMSOC_HAS_HPMSDK_DMAV2").  HPM6E00 has
+# DMAv2, while HPM6750 has the legacy DMA IP and therefore does not need it.
+CFLAGS += -DHPMSOC_HAS_HPMSDK_DMAV2
+
 # GCC 12+ needs _zicsr for the CSR instructions in start.S / irq.h, and the
 # ISA/ABI must follow CONFIG_ARCH_FPU/DPFPU (this file is included last).
 ifeq ($(CONFIG_ARCH_DPFPU),y)

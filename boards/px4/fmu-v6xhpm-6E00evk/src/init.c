@@ -243,35 +243,10 @@ hpm_boardinitialize(void)
  *   any failure to indicate the nature of the failure.
  ****************************************************************************/
 
-struct spi_dev_s *hpm_spibus_initialize(int bus)
-{
-	(void)bus;
-	return NULL;
-}
-
-struct i2c_master_s *hpm_i2cbus_initialize(int bus)
-{
-	(void)bus;
-	return NULL;
-}
-
-struct i2c_master_s *px4_i2cbus_initialize(int bus)
-{
-	(void)bus;
-	return NULL;
-}
-
-int hpm_i2cbus_uninitialize(struct i2c_master_s *dev)
-{
-	(void)dev;
-	return OK;
-}
-
-int px4_i2cbus_uninitialize(struct i2c_master_s *dev)
-{
-	(void)dev;
-	return OK;
-}
+/* I2C: the bus initialisers come from the NuttX HPM I2C master driver, and
+ * the board pads are configured by hpm_i2cbus_pins_init() in i2c.cpp.
+ * SPI is not ported to HPM6E00 yet - see bringup_stubs.cpp.
+ */
 
  __EXPORT int board_app_initialize(uintptr_t arg)
 {

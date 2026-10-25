@@ -34,7 +34,7 @@
 px4_add_library(drivers_board
 	init.c
 	bringup_stubs.cpp
-	#i2c.cpp
+	i2c.cpp
 	mtd.cpp
 	#spi.cpp
 	#timer_config.cpp
