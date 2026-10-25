@@ -60,6 +60,7 @@
 
 extern "C" struct spi_dev_s *hpm_spibus_initialize(int bus);
 
+
 #define TEST_LEN 16
 
 static void dump(const char *name, const uint8_t *data, int len)
