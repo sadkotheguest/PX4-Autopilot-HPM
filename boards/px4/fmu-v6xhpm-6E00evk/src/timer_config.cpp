@@ -33,19 +33,21 @@
 
 #include <px4_arch/io_timer_hw_description.h>
 
+/* HPM6E00EVK: the motor PWM header is wired to PWM1 channels 0..3 on
+ * PE08..PE11.  PWM0 is kept in the list for a second timer group (for
+ * example the RGB LED on PWM1 channels 6/7 and PWM0 channel 4).
+ */
 
 constexpr io_timers_t io_timers[MAX_IO_TIMERS] = {
 	initIOTimer(Timer::PWM0),
 	initIOTimer(Timer::PWM1),
-	// initIOTimer(Timer::PWM2),
-	// initIOTimer(Timer::PWM3),
 };
 
 constexpr timer_io_channels_t timer_io_channels[MAX_TIMER_IO_CHANNELS] = {
-	initIOTimerChannel(io_timers, {Timer::PWM0, Timer::Channel4}, {GPIO::PortB, GPIO::Pin27}, Timer::TRGM_NotUsed),
-	initIOTimerChannel(io_timers, {Timer::PWM0, Timer::Channel5}, {GPIO::PortB, GPIO::Pin26}, Timer::TRGM_NotUsed),
-	initIOTimerChannel(io_timers, {Timer::PWM1, Timer::Channel0}, {GPIO::PortB, GPIO::Pin19}, Timer::TRGM_NotUsed),
-	initIOTimerChannel(io_timers, {Timer::PWM1, Timer::Channel1}, {GPIO::PortB, GPIO::Pin18}, Timer::TRGM_NotUsed),
+	initIOTimerChannel(io_timers, {Timer::PWM1, Timer::Channel0}, {GPIO::PortE, GPIO::Pin8}, Timer::TRGM_NotUsed),
+	initIOTimerChannel(io_timers, {Timer::PWM1, Timer::Channel1}, {GPIO::PortE, GPIO::Pin9}, Timer::TRGM_NotUsed),
+	initIOTimerChannel(io_timers, {Timer::PWM1, Timer::Channel2}, {GPIO::PortE, GPIO::Pin10}, Timer::TRGM_NotUsed),
+	initIOTimerChannel(io_timers, {Timer::PWM1, Timer::Channel3}, {GPIO::PortE, GPIO::Pin11}, Timer::TRGM_NotUsed),
 };
 
 constexpr io_timers_channel_mapping_t io_timers_channel_mapping =

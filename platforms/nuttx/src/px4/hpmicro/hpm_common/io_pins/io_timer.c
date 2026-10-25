@@ -60,7 +60,11 @@
 
 #include <hpm_gpio.h>
 #include "hpm_trgm_drv.h"
+#if defined(CONFIG_ARCH_CHIP_HPM6E00_SDK)
+#include "hpm_pwmv2_drv.h"
+#else
 #include "hpm_pwm_drv.h"
+#endif
 #include "hpm_clock_drv.h"
 
 #if defined(CONFIG_HPM_PWM0)
@@ -87,6 +91,86 @@ static int io_timer_handler3(int irq, void *context, void *arg);
 #define PWM_CMP_SHADOW_CH 23
 #define PWM_CH_TRGM_NOT_USED 0xFF
 #define PWM_OUT_CH8 8
+
+#if defined(CONFIG_ARCH_CHIP_HPM6E00_SDK)
+/* HPM6E00: PWMv2 keeps the period and the compare values in shadow registers.
+ * Shadow 0 holds the period, shadow (cmp + 1) the value of comparator "cmp".
+ */
+
+#define IO_TIMER_V2_PERIOD_SHADOW       PWMV2_SHADOW_INDEX(0)
+/* PWMV2_SHADOW_INDEX() is a token paste and only accepts a literal, so the
+ * comparator shadow index is computed as a plain number.
+ */
+#define IO_TIMER_V2_CMP_SHADOW(cmp)     ((uint8_t)((cmp) + 1))
+#define IO_TIMER_V2_COUNTER_COUNT       (4)
+
+static inline PWMV2_Type *io_timer_v2_base(unsigned timer)
+{
+	return (PWMV2_Type *)io_timers[timer].base;
+}
+
+static inline void io_timer_v2_set_period(unsigned timer, uint32_t reload)
+{
+	PWMV2_Type *ptr = io_timer_v2_base(timer);
+
+	pwmv2_shadow_register_unlock(ptr);
+	pwmv2_set_shadow_val(ptr, IO_TIMER_V2_PERIOD_SHADOW, reload, 0, false);
+
+	for (int counter = 0; counter < IO_TIMER_V2_COUNTER_COUNT; counter++) {
+		pwmv2_counter_select_data_offset_from_shadow_value(ptr, (pwm_counter_t)counter, IO_TIMER_V2_PERIOD_SHADOW);
+		pwmv2_set_reload_update_time(ptr, (pwm_counter_t)counter, pwm_reload_update_on_reload);
+	}
+
+	pwmv2_shadow_register_lock(ptr);
+}
+
+static inline void io_timer_v2_config_cmp(unsigned timer, uint8_t cmp_index, uint32_t value,
+		pwm_cmp_shadow_register_update_trigger_t trigger)
+{
+	PWMV2_Type *ptr = io_timer_v2_base(timer);
+	pwmv2_cmp_config_t cmp_config = {0};
+
+	/* mode stays 0 (output compare); pwmv2_config_cmp() only uses the source,
+	 * the update trigger and the compare value.
+	 */
+	cmp_config.cmp = value;
+	cmp_config.cmp_source = cmp_value_from_shadow_val;
+	cmp_config.cmp_source_index = IO_TIMER_V2_CMP_SHADOW(cmp_index);
+	cmp_config.update_trigger = trigger;
+
+	pwmv2_config_cmp(ptr, cmp_index, &cmp_config);
+}
+
+static inline void io_timer_v2_update_cmp(unsigned timer, uint8_t cmp_index, uint32_t value)
+{
+	io_timer_v2_config_cmp(timer, cmp_index, value, pwm_shadow_register_update_on_modify);
+}
+
+static inline uint32_t io_timer_v2_get_cmp(unsigned timer, uint8_t cmp_index)
+{
+	return io_timer_v2_base(timer)->CMP_VAL_WORK[cmp_index];
+}
+
+static inline void io_timer_v2_start(unsigned timer)
+{
+	for (int counter = 0; counter < IO_TIMER_V2_COUNTER_COUNT; counter++) {
+		pwmv2_enable_counter(io_timer_v2_base(timer), (pwm_counter_t)counter);
+		pwmv2_start_pwm_output(io_timer_v2_base(timer), (pwm_counter_t)counter);
+	}
+}
+
+static inline void io_timer_v2_stop(unsigned timer)
+{
+	for (int counter = 0; counter < IO_TIMER_V2_COUNTER_COUNT; counter++) {
+		pwmv2_disable_counter(io_timer_v2_base(timer), (pwm_counter_t)counter);
+	}
+}
+
+static inline void io_timer_v2_issue_lock(unsigned timer)
+{
+	pwmv2_issue_shadow_register_lock_event(io_timer_v2_base(timer));
+}
+#endif /* CONFIG_ARCH_CHIP_HPM6E00_SDK */
 
 //                                                                NotUsed   PWMOut  PWMIn Capture OneShot Trigger Dshot LED PPS Other
 io_timer_channel_allocation_t channel_allocations[IOTimerChanModeSize] = { UINT16_MAX,   0,  0,  0, 0, 0, 0, 0, 0, 0 };
@@ -402,9 +486,12 @@ static int allocate_channel(unsigned channel, io_timer_channel_mode_t mode)
 
 static int timer_set_rate(unsigned timer, unsigned rate)
 {
-	/* configure the timer to update at the desired rate */
-
 	uint32_t reload = (clock_get_frequency(io_timers[timer].clock_name) / rate) - 1;
+
+#if defined(CONFIG_ARCH_CHIP_HPM6E00_SDK)
+	/* PWMv2: the period lives in a shadow register that every counter uses. */
+	io_timer_v2_set_period(timer, reload);
+#else
 	pwm_cmp_config_t cmp_config = {0};
 
 	pwm_set_reload((PWM_Type *)io_timers[timer].base, 0, reload);
@@ -413,12 +500,27 @@ static int timer_set_rate(unsigned timer, unsigned rate)
 	cmp_config.cmp = reload;
 	cmp_config.update_trigger = pwm_shadow_register_update_on_modify;
 	pwm_load_cmp_shadow_on_match((PWM_Type *)io_timers[timer].base, PWM_CMP_SHADOW_CH, &cmp_config);
+#endif
 
 	return 0;
 }
 
 static inline void io_timer_set_oneshot_mode(unsigned timer, int changed_channels)
 {
+#if defined(CONFIG_ARCH_CHIP_HPM6E00_SDK)
+	io_timer_v2_set_period(timer, 0xFFFFFF);
+
+	for (unsigned channel = 0; changed_channels != 0 && channel < MAX_TIMER_IO_CHANNELS; channel++) {
+		if (changed_channels & (1 << channel)) {
+			io_timer_v2_config_cmp(timer, channel * 2, 0xFFFFFF, pwm_shadow_register_update_on_shlk);
+			io_timer_v2_config_cmp(timer, channel * 2 + 1, 0xFFFFFF, pwm_shadow_register_update_on_shlk);
+
+			changed_channels &= ~(1 << channel);
+		}
+	}
+
+	io_timer_v2_issue_lock(timer);
+#else
 	pwm_set_reload((PWM_Type *)io_timers[timer].base, 0, 0xFFFFFF);
 
 	for (unsigned channel = 0; changed_channels != 0 &&  channel < MAX_TIMER_IO_CHANNELS; channel++) {
@@ -440,10 +542,21 @@ static inline void io_timer_set_oneshot_mode(unsigned timer, int changed_channel
 	}
 
 	pwm_issue_shadow_register_lock_event((PWM_Type *)io_timers[timer].base);
+#endif
 }
 
 static inline void io_timer_set_PWM_mode(unsigned timer, int changed_channels)
 {
+#if defined(CONFIG_ARCH_CHIP_HPM6E00_SDK)
+	for (unsigned channel = 0; changed_channels != 0 && channel < MAX_TIMER_IO_CHANNELS; channel++) {
+		if (changed_channels & (1 << channel)) {
+			io_timer_v2_config_cmp(timer, channel * 2, 0xFFFFFF, pwm_shadow_register_update_on_reload);
+			io_timer_v2_config_cmp(timer, channel * 2 + 1, 0xFFFFFF, pwm_shadow_register_update_on_reload);
+
+			changed_channels &= ~(1 << channel);
+		}
+	}
+#else
 	for (unsigned channel = 0; changed_channels != 0 &&  channel < MAX_TIMER_IO_CHANNELS; channel++) {
 		if (changed_channels & (1 << channel)) {
 
@@ -461,6 +574,7 @@ static inline void io_timer_set_PWM_mode(unsigned timer, int changed_channels)
 
 		}
 	}
+#endif
 }
 
 void io_timer_trigger(unsigned channels_mask)	/* Trigger all timer's channels in Oneshot mode */
@@ -493,10 +607,18 @@ void io_timer_trigger(unsigned channels_mask)	/* Trigger all timer's channels in
 		irqstate_t flags = px4_enter_critical_section();
 
 		for (actions = 0; actions < MAX_IO_TIMERS && action_cache[actions].base != 0; actions++) {
+#if defined(CONFIG_ARCH_CHIP_HPM6E00_SDK)
+			/* PWMv2 latches the shadow values and starts all four counters
+			 * together; no TRGM PWM sync input is routed on this SoC.
+			 */
+			pwmv2_issue_shadow_register_lock_event((PWMV2_Type *)action_cache[actions].base);
+			pwmv2_start_pwm_output_sync((PWMV2_Type *)action_cache[actions].base, 0x0F);
+#else
 			pwm_issue_shadow_register_lock_event((PWM_Type *)action_cache[actions].base);
 
 			trgm_output_update_source((TRGM_Type *)action_cache[actions].trgm_base, TRGM_TRGOCFG_PWM_SYNCI, 1);
 			trgm_output_update_source((TRGM_Type *)action_cache[actions].trgm_base, TRGM_TRGOCFG_PWM_SYNCI, 0);
+#endif
 		}
 
 		px4_leave_critical_section(flags);
@@ -521,10 +643,14 @@ int io_timer_init_timer(unsigned timer, io_timer_channel_mode_t mode)
 		clock_add_to_group((clock_name_t)io_timers[timer].clock_name, 0);
 
 		/* disable and configure the timer */
+#if defined(CONFIG_ARCH_CHIP_HPM6E00_SDK)
+		io_timer_v2_stop(timer);
+#else
 		pwm_stop_counter((PWM_Type *)io_timers[timer].base);
 
 		/* enable reload when synci assert */
 		pwm_enable_reload_at_synci((PWM_Type *)io_timers[timer].base);
+#endif
 
 		/*
 		 * Note we do the Standard PWM Out init here
@@ -672,6 +798,7 @@ int io_timer_channel_init(unsigned channel, io_timer_channel_mode_t mode,
 
 			/* Config Trgm */
 
+#if !defined(CONFIG_ARCH_CHIP_HPM6E00_SDK)
 			if (timer_io_channels[channel].trgm_px != PWM_CH_TRGM_NOT_USED) {
 				// configure TRGM input
 				trgm_output_t trgm_config;
@@ -681,10 +808,34 @@ int io_timer_channel_init(unsigned channel, io_timer_channel_mode_t mode,
 				trgm_config.input = (timer_io_channels[channel].timer_channel - PWM_OUT_CH8) + HPM_TRGM0_INPUT_SRC_PWM0_CH8REF;    /* Only ch8 ~ ch23 should be use trigmux */
 				trgm_output_config((TRGM_Type *)io_timers[timer].trgm_base, (uint8_t)timer_io_channels[channel].trgm_px, &trgm_config);
 			}
+#endif
 		}
 
 		/* configure the channel */
 
+#if defined(CONFIG_ARCH_CHIP_HPM6E00_SDK)
+		pwmv2_config_t pwm_config;
+
+		pwmv2_get_default_config(&pwm_config);
+		pwm_config.enable_output = true;
+
+		pwm_cmp_shadow_register_update_trigger_t cmp_trigger =
+			(mode == IOTimerChanMode_PWMOut) ? pwm_shadow_register_update_on_reload
+							 : pwm_shadow_register_update_on_shlk;
+
+		/* A channel uses its own comparator pair: (channel * 2, channel * 2 + 1). */
+		io_timer_v2_config_cmp(timer, channel * 2, 0xFFFFFF, cmp_trigger);
+		io_timer_v2_config_cmp(timer, channel * 2 + 1, 0xFFFFFF, cmp_trigger);
+
+		/*
+		 * config pwm
+		 */
+		if (status_success != pwmv2_setup_waveform((PWMV2_Type *)io_timers[timer].base,
+				(pwm_channel_t)timer_io_channels[channel].timer_channel,
+				&pwm_config, channel * 2, NULL, 0)) {
+			printf("failed to setup waveform\n");
+		}
+#else
 		pwm_cmp_config_t cmp_config[2] = {0};
 		pwm_config_t pwm_config;
 
@@ -713,6 +864,7 @@ int io_timer_channel_init(unsigned channel, io_timer_channel_mode_t mode,
 		if (status_success != pwm_setup_waveform((PWM_Type *)io_timers[timer].base, timer_io_channels[channel].timer_channel, &pwm_config, channel * 2, &cmp_config[0], 2)) {
 			printf("failed to setup waveform\n");
 		}
+#endif
 
 
 #if !defined(BOARD_HAS_NO_CAPTURE)
@@ -817,9 +969,18 @@ int io_timer_set_enable(bool state, io_timer_channel_mode_t mode, io_timer_chann
 					px4_arch_configgpio(action_cache[actions].gpios[index]);
 				}
 			}
+#if !defined(CONFIG_ARCH_CHIP_HPM6E00_SDK)
 			trgm_output_update_source((TRGM_Type *)action_cache[actions].trgm_base, TRGM_TRGOCFG_PWM_SYNCI, 1);
 			trgm_output_update_source((TRGM_Type *)action_cache[actions].trgm_base, TRGM_TRGOCFG_PWM_SYNCI, 0);
-			pwm_start_counter((PWM_Type *)action_cache[actions].base);
+#endif
+#if defined(CONFIG_ARCH_CHIP_HPM6E00_SDK)
+				for (int counter = 0; counter < IO_TIMER_V2_COUNTER_COUNT; counter++) {
+					pwmv2_enable_counter((PWMV2_Type *)action_cache[actions].base, (pwm_counter_t)counter);
+					pwmv2_start_pwm_output((PWMV2_Type *)action_cache[actions].base, (pwm_counter_t)counter);
+				}
+#else
+				pwm_start_counter((PWM_Type *)action_cache[actions].base);
+#endif
 		}
 
 		px4_leave_critical_section(flags);
@@ -850,8 +1011,13 @@ int io_timer_set_ccr(unsigned channel, uint16_t value)     // value in 1us, ones
 			} else {
 				ccr = (uint32_t)value * (clock_get_frequency(io_timers[timer].clock_name) / BOARD_PWM_FREQ);
 			}
+#if defined(CONFIG_ARCH_CHIP_HPM6E00_SDK)
+			io_timer_v2_update_cmp(timer, channel * 2, 0);
+			io_timer_v2_update_cmp(timer, channel * 2 + 1, ccr);
+#else
 			pwm_cmp_update_cmp_value((PWM_Type *)io_timers[timer].base, channel * 2, 0, 0);
 			pwm_cmp_update_cmp_value((PWM_Type *)io_timers[timer].base, channel * 2+ 1, ccr , 0);
+#endif
 		}
 	}
 
@@ -869,7 +1035,11 @@ uint16_t io_channel_get_ccr(unsigned channel)     // return value in 1us
 		if ((mode == IOTimerChanMode_PWMOut) ||
 		    (mode == IOTimerChanMode_OneShot) ||
 		    (mode == IOTimerChanMode_Trigger)) {
+			#if defined(CONFIG_ARCH_CHIP_HPM6E00_SDK)
+			value = io_timer_v2_get_cmp(timer, channel * 2 + 1);
+#else
 			value = pwm_cmp_get_cmp_value((PWM_Type *)io_timers[timer].base, channel * 2 + 1);
+#endif
 			if (mode == IOTimerChanMode_OneShot) {
 				value = value / (clock_get_frequency(io_timers[timer].clock_name) / BOARD_ONESHOT_FREQ);
 			} else {

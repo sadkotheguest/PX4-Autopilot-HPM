@@ -43,6 +43,8 @@ namespace Timer
 enum Timer {
 	PWM0 = 0,
 	PWM1,
+	PWM2,
+	PWM3,
 };
 
 enum Channel {
