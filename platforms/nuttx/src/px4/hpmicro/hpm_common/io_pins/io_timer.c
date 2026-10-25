@@ -94,19 +94,35 @@ static int io_timer_handler3(int irq, void *context, void *arg);
 
 #if defined(CONFIG_ARCH_CHIP_HPM6E00_SDK)
 /* HPM6E00: PWMv2 keeps the period and the compare values in shadow registers.
- * Shadow 0 holds the period, shadow (cmp + 1) the value of comparator "cmp".
+ * Shadow 0 holds the period, every channel owns two more slots: the duty
+ * comparator (reload = 0 %) and the period comparator (reload + 1).
  */
 
 #define IO_TIMER_V2_PERIOD_SHADOW       PWMV2_SHADOW_INDEX(0)
-/* PWMV2_SHADOW_INDEX() is a token paste and only accepts a literal, so the
- * comparator shadow index is computed as a plain number.
- */
-#define IO_TIMER_V2_CMP_SHADOW(cmp)     ((uint8_t)((cmp) + 1))
 #define IO_TIMER_V2_COUNTER_COUNT       (4)
+
+/* A comparator refers to its shadow slot by number; PWMV2_SHADOW_INDEX() is a
+ * token paste and only accepts a literal, so these are plain expressions.
+ */
+static inline uint8_t io_timer_v2_duty_shadow(uint8_t pwm_ch)
+{
+	return (uint8_t)(1 + 2 * pwm_ch);
+}
+
+static inline uint8_t io_timer_v2_period_cmp_shadow(uint8_t pwm_ch)
+{
+	return (uint8_t)(2 + 2 * pwm_ch);
+}
 
 static inline PWMV2_Type *io_timer_v2_base(unsigned timer)
 {
 	return (PWMV2_Type *)io_timers[timer].base;
+}
+
+/* Period in whole counter ticks, as stored in shadow 0. */
+static inline uint32_t io_timer_v2_reload(unsigned timer)
+{
+	return io_timer_v2_base(timer)->SHADOW_VAL[IO_TIMER_V2_PERIOD_SHADOW] >> 8;
 }
 
 static inline void io_timer_v2_set_period(unsigned timer, uint32_t reload)
@@ -119,11 +135,55 @@ static inline void io_timer_v2_set_period(unsigned timer, uint32_t reload)
 	for (int counter = 0; counter < IO_TIMER_V2_COUNTER_COUNT; counter++) {
 		pwmv2_counter_select_data_offset_from_shadow_value(ptr, (pwm_counter_t)counter, IO_TIMER_V2_PERIOD_SHADOW);
 		pwmv2_set_reload_update_time(ptr, (pwm_counter_t)counter, pwm_reload_update_on_reload);
+		pwmv2_counter_burst_disable(ptr, (pwm_counter_t)counter);
 	}
 
 	pwmv2_shadow_register_lock(ptr);
 }
 
+/* Set up one channel exactly like the SDK pwmv2 sample: comparator 0 is the
+ * duty, comparator 1 the period edge, both fed from the shadow registers.
+ */
+static inline void io_timer_v2_config_channel(unsigned timer, uint8_t pwm_ch)
+{
+	PWMV2_Type *ptr = io_timer_v2_base(timer);
+	const uint32_t reload = io_timer_v2_reload(timer);
+
+	pwmv2_shadow_register_unlock(ptr);
+	pwmv2_set_shadow_val(ptr, io_timer_v2_duty_shadow(pwm_ch), reload, 0, false);
+	pwmv2_set_shadow_val(ptr, io_timer_v2_period_cmp_shadow(pwm_ch), reload + 1, 0, false);
+	pwmv2_shadow_register_lock(ptr);
+
+	pwmv2_select_cmp_source(ptr, (uint8_t)(pwm_ch * 2), cmp_value_from_shadow_val,
+				io_timer_v2_duty_shadow(pwm_ch));
+	pwmv2_select_cmp_source(ptr, (uint8_t)(pwm_ch * 2 + 1), cmp_value_from_shadow_val,
+				io_timer_v2_period_cmp_shadow(pwm_ch));
+
+	pwmv2_disable_four_cmp(ptr, (pwm_channel_t)(pwm_ch & ~1));
+	pwmv2_channel_enable_output(ptr, (pwm_channel_t)pwm_ch);
+}
+
+/* Duty in counter ticks: 0 % = reload, 100 % = 0. */
+static inline void io_timer_v2_set_duty(unsigned timer, uint8_t pwm_ch, uint32_t duty_ticks)
+{
+	PWMV2_Type *ptr = io_timer_v2_base(timer);
+	const uint32_t reload = io_timer_v2_reload(timer);
+	const uint32_t cmp = (duty_ticks > reload) ? 0 : reload - duty_ticks;
+
+	pwmv2_shadow_register_unlock(ptr);
+	pwmv2_set_shadow_val(ptr, io_timer_v2_duty_shadow(pwm_ch), cmp, 0, false);
+	pwmv2_shadow_register_lock(ptr);
+}
+
+static inline uint32_t io_timer_v2_get_duty(unsigned timer, uint8_t pwm_ch)
+{
+	const uint32_t reload = io_timer_v2_reload(timer);
+	const uint32_t cmp = io_timer_v2_base(timer)->CMP_VAL_WORK[pwm_ch * 2] >> 8;
+
+	return (cmp > reload) ? 0 : reload - cmp;
+}
+
+/* Generic comparator helper, used by the one-shot and PWM mode switches. */
 static inline void io_timer_v2_config_cmp(unsigned timer, uint8_t cmp_index, uint32_t value,
 		pwm_cmp_shadow_register_update_trigger_t trigger)
 {
@@ -135,20 +195,10 @@ static inline void io_timer_v2_config_cmp(unsigned timer, uint8_t cmp_index, uin
 	 */
 	cmp_config.cmp = value;
 	cmp_config.cmp_source = cmp_value_from_shadow_val;
-	cmp_config.cmp_source_index = IO_TIMER_V2_CMP_SHADOW(cmp_index);
+	cmp_config.cmp_source_index = (uint8_t)(cmp_index + 1);
 	cmp_config.update_trigger = trigger;
 
 	pwmv2_config_cmp(ptr, cmp_index, &cmp_config);
-}
-
-static inline void io_timer_v2_update_cmp(unsigned timer, uint8_t cmp_index, uint32_t value)
-{
-	io_timer_v2_config_cmp(timer, cmp_index, value, pwm_shadow_register_update_on_modify);
-}
-
-static inline uint32_t io_timer_v2_get_cmp(unsigned timer, uint8_t cmp_index)
-{
-	return io_timer_v2_base(timer)->CMP_VAL_WORK[cmp_index];
 }
 
 static inline void io_timer_v2_start(unsigned timer)
@@ -644,6 +694,10 @@ int io_timer_init_timer(unsigned timer, io_timer_channel_mode_t mode)
 
 		/* disable and configure the timer */
 #if defined(CONFIG_ARCH_CHIP_HPM6E00_SDK)
+		/* The timer is allocated as a whole, so reset the PWMv2 module once
+		 * here; channels are configured individually afterwards.
+		 */
+		pwmv2_deinit((PWMV2_Type *)io_timers[timer].base);
 		io_timer_v2_stop(timer);
 #else
 		pwm_stop_counter((PWM_Type *)io_timers[timer].base);
@@ -814,27 +868,10 @@ int io_timer_channel_init(unsigned channel, io_timer_channel_mode_t mode,
 		/* configure the channel */
 
 #if defined(CONFIG_ARCH_CHIP_HPM6E00_SDK)
-		pwmv2_config_t pwm_config;
-
-		pwmv2_get_default_config(&pwm_config);
-		pwm_config.enable_output = true;
-
-		pwm_cmp_shadow_register_update_trigger_t cmp_trigger =
-			(mode == IOTimerChanMode_PWMOut) ? pwm_shadow_register_update_on_reload
-							 : pwm_shadow_register_update_on_shlk;
-
-		/* A channel uses its own comparator pair: (channel * 2, channel * 2 + 1). */
-		io_timer_v2_config_cmp(timer, channel * 2, 0xFFFFFF, cmp_trigger);
-		io_timer_v2_config_cmp(timer, channel * 2 + 1, 0xFFFFFF, cmp_trigger);
-
-		/*
-		 * config pwm
+		/* Same sequence as the SDK pwmv2 sample: comparator 0 is the duty
+		 * (reload = 0 %), comparator 1 the period edge, both from shadows.
 		 */
-		if (status_success != pwmv2_setup_waveform((PWMV2_Type *)io_timers[timer].base,
-				(pwm_channel_t)timer_io_channels[channel].timer_channel,
-				&pwm_config, channel * 2, NULL, 0)) {
-			printf("failed to setup waveform\n");
-		}
+		io_timer_v2_config_channel(timer, (uint8_t)timer_io_channels[channel].timer_channel);
 #else
 		pwm_cmp_config_t cmp_config[2] = {0};
 		pwm_config_t pwm_config;
@@ -1012,8 +1049,7 @@ int io_timer_set_ccr(unsigned channel, uint16_t value)     // value in 1us, ones
 				ccr = (uint32_t)value * (clock_get_frequency(io_timers[timer].clock_name) / BOARD_PWM_FREQ);
 			}
 #if defined(CONFIG_ARCH_CHIP_HPM6E00_SDK)
-			io_timer_v2_update_cmp(timer, channel * 2, 0);
-			io_timer_v2_update_cmp(timer, channel * 2 + 1, ccr);
+			io_timer_v2_set_duty(timer, (uint8_t)timer_io_channels[channel].timer_channel, ccr);
 #else
 			pwm_cmp_update_cmp_value((PWM_Type *)io_timers[timer].base, channel * 2, 0, 0);
 			pwm_cmp_update_cmp_value((PWM_Type *)io_timers[timer].base, channel * 2+ 1, ccr , 0);
@@ -1036,7 +1072,7 @@ uint16_t io_channel_get_ccr(unsigned channel)     // return value in 1us
 		    (mode == IOTimerChanMode_OneShot) ||
 		    (mode == IOTimerChanMode_Trigger)) {
 			#if defined(CONFIG_ARCH_CHIP_HPM6E00_SDK)
-			value = io_timer_v2_get_cmp(timer, channel * 2 + 1);
+			value = io_timer_v2_get_duty(timer, (uint8_t)timer_io_channels[channel].timer_channel);
 #else
 			value = pwm_cmp_get_cmp_value((PWM_Type *)io_timers[timer].base, channel * 2 + 1);
 #endif
