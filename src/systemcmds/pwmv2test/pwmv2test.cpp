@@ -1507,7 +1507,12 @@ static bool gcap_measure(unsigned rate_kbit, unsigned throttle, uint16_t *sent_o
 	dshot_motor_data_set(0, (uint16_t)throttle, false);
 	up_dshot_arm(true);
 	up_dshot_tc_reset();
+
+	/* Arm the capture DMA well before the first edge, otherwise the event of
+	 * the leading dummy pulse can be missed and the frame shifts.
+	 */
 	up_dshot_rxg_start();
+	usleep(50);
 	up_dshot_trigger();
 
 	uint32_t spin = 0;
@@ -1543,41 +1548,48 @@ static bool gcap_measure(unsigned rate_kbit, unsigned throttle, uint16_t *sent_o
 		}
 	}
 
-	/* The GPTMR measure event reports the width of the previous pulse and the
-	 * first entry may be a stale measurement, so try a few offsets.
+	/* The GPTMR measure event reports the width of the PREVIOUS pulse, so the
+	 * first two entries are the stale measurement and the leading dummy pulse.
 	 */
-	unsigned best_offset = 0;
+	const unsigned expected_offset = 2u;
 
-	for (unsigned offset = 0; offset < 6u; offset++) {
-		uint16_t candidate = 0;
-		unsigned cnt = 0;
+	uint16_t frame_candidate = 0;
+	unsigned cnt = 0;
 
-		for (unsigned i = offset; i < nvalid && cnt < 16u; i++) {
-			candidate = (uint16_t)((candidate << 1) | ((valid[i] > (bit_ticks / 2u)) ? 1u : 0u));
-			cnt++;
-		}
+	for (unsigned i = expected_offset; i < nvalid && cnt < 16u; i++) {
+		frame_candidate = (uint16_t)((frame_candidate << 1) | ((valid[i] > (bit_ticks / 2u)) ? 1u : 0u));
+		cnt++;
+	}
 
-		if (cnt == 16u && candidate == *sent_out) {
-			best_offset = offset;
-			break;
+	frame = frame_candidate;
+	bits = cnt;
+	edges = nvalid;
+
+	/* Diagnostics only: report whether some other offset would have matched. */
+	unsigned alt = 99u;
+
+	if (!(cnt == 16u && frame_candidate == *sent_out)) {
+		for (unsigned offset = 0; offset < 6u; offset++) {
+			if (offset == expected_offset) {
+				continue;
+			}
+
+			uint16_t candidate = 0;
+			unsigned c = 0;
+
+			for (unsigned i = offset; i < nvalid && c < 16u; i++) {
+				candidate = (uint16_t)((candidate << 1) | ((valid[i] > (bit_ticks / 2u)) ? 1u : 0u));
+				c++;
+			}
+
+			if (c == 16u && candidate == *sent_out) {
+				alt = offset;
+				break;
+			}
 		}
 	}
 
-	{
-		uint16_t candidate = 0;
-		unsigned cnt = 0;
-
-		for (unsigned i = best_offset; i < nvalid && cnt < 16u; i++) {
-			candidate = (uint16_t)((candidate << 1) | ((valid[i] > (bit_ticks / 2u)) ? 1u : 0u));
-			cnt++;
-		}
-
-		frame = candidate;
-		bits = cnt;
-		edges = nvalid;
-	}
-
-	*dummy_out = best_offset;
+	*dummy_out = (alt != 99u) ? alt : expected_offset;
 	*recv_out = frame;
 	*bits_out = bits;
 	*edges_out = edges;

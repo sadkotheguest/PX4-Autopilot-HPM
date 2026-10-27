@@ -81,7 +81,7 @@
 #include "hpm_trgmmux_src.h"
 
 /* 16 bit times per frame: bit15 preloaded, DMA sends bit14..bit0 + idle. */
-#define DSHOT_FRAME_WORDS   17u   /* 16 data + trailing pulse */
+#define DSHOT_FRAME_WORDS   19u   /* 16 data + trailing pulse + 2 idle */
 #define DSHOT_DATA_WORDS    16u
 
 #define DSHOT_MAX_CHANNELS  4u
