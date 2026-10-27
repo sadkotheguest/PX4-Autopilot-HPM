@@ -66,21 +66,39 @@ px4_add_git_submodule(TARGET git_nuttx_apps PATH "${NUTTX_SRC_DIR}/apps")
 # make olddefconfig (inflate defconfig to full .config)
 execute_process(COMMAND ${CMAKE_COMMAND} -E make_directory ${NUTTX_CONFIG_DIR}/src) # needed for NuttX build
 execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different ${NUTTX_SRC_DIR}/Make.defs.in ${NUTTX_DIR}/Make.defs) # Create a temporary Toplevel Make.defs for the oldconfig step
-execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different ${NUTTX_DEFCONFIG} ${NUTTX_DIR}/.config)
-execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different ${NUTTX_DEFCONFIG} ${NUTTX_DIR}/defconfig)
+
+# Inflate the defconfig into nuttx/.config only when its content changed.
+# This step rewrites .config and touches defconfig_inflate_stamp, and the
+# NuttX context step then regenerates include/nuttx/config.h, which is
+# included by every PX4 object: doing it on every configure turned each
+# build into a full rebuild.
+file(SHA256 ${NUTTX_DEFCONFIG} _nuttx_defconfig_hash)
+set(_nuttx_inflate_hash_file ${CMAKE_CURRENT_BINARY_DIR}/defconfig_inflate_stamp.hash)
+set(_nuttx_inflate_hash "")
+if(EXISTS ${_nuttx_inflate_hash_file})
+	file(READ ${_nuttx_inflate_hash_file} _nuttx_inflate_hash)
+	string(STRIP "${_nuttx_inflate_hash}" _nuttx_inflate_hash)
+endif()
+
+if(NOT _nuttx_inflate_hash STREQUAL _nuttx_defconfig_hash)
+	execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different ${NUTTX_DEFCONFIG} ${NUTTX_DIR}/.config)
+	execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different ${NUTTX_DEFCONFIG} ${NUTTX_DIR}/defconfig)
+
+	execute_process(
+		COMMAND ${NUTTX_SRC_DIR}/tools/px4_nuttx_make_olddefconfig.sh
+		WORKING_DIRECTORY ${NUTTX_DIR}
+		OUTPUT_FILE ${CMAKE_CURRENT_BINARY_DIR}/nuttx_olddefconfig.log
+		RESULT_VARIABLE ret
+	)
+	execute_process(
+		COMMAND ${CMAKE_COMMAND} -E touch ${CMAKE_CURRENT_BINARY_DIR}/defconfig_inflate_stamp
+		WORKING_DIRECTORY ${NUTTX_DIR}
+	)
+	file(WRITE ${_nuttx_inflate_hash_file} "${_nuttx_defconfig_hash}\n")
+endif()
 
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${NUTTX_DIR}/defconfig)
 
-execute_process(
-	COMMAND ${NUTTX_SRC_DIR}/tools/px4_nuttx_make_olddefconfig.sh
-	WORKING_DIRECTORY ${NUTTX_DIR}
-	OUTPUT_FILE ${CMAKE_CURRENT_BINARY_DIR}/nuttx_olddefconfig.log
-	RESULT_VARIABLE ret
-)
-execute_process(
-	COMMAND ${CMAKE_COMMAND} -E touch ${CMAKE_CURRENT_BINARY_DIR}/defconfig_inflate_stamp
-	WORKING_DIRECTORY ${NUTTX_DIR}
-)
 execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different ${NUTTX_DIR}/.config ${PX4_BINARY_DIR}/NuttX/nuttx/.config)
 
 ###############################################################################

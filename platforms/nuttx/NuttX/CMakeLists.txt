@@ -75,7 +75,12 @@ endif()
 add_custom_command(
 	OUTPUT ${NUTTX_DIR}/.config
 	COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_BINARY_DIR}/nuttx/Make.defs ${NUTTX_DIR}/Make.defs
-	COMMAND ${PX4_BASH_EXECUTABLE} -c "cat '${NUTTX_DEFCONFIG}' '${EXTRA_NUTTX_CONFIG_FILE}' > '${NUTTX_DIR}/.config'"
+	# Concatenate into the build directory first: writing nuttx/.config in
+	# place bumps its mtime even when the content is unchanged, which makes
+	# the context step regenerate include/nuttx/config.h and rebuild
+	# everything.
+	COMMAND ${PX4_BASH_EXECUTABLE} -c "cat '${NUTTX_DEFCONFIG}' '${EXTRA_NUTTX_CONFIG_FILE}' > '${CMAKE_CURRENT_BINARY_DIR}/nuttx/.config.gen'"
+	COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_BINARY_DIR}/nuttx/.config.gen ${NUTTX_DIR}/.config
 	COMMAND ${CMAKE_COMMAND} -E copy_if_different ${NUTTX_DEFCONFIG} ${NUTTX_DIR}/defconfig
 	COMMAND ${PX4_BASH_EXECUTABLE} -c "'${NUTTX_SRC_DIR}/tools/px4_nuttx_make_olddefconfig.sh' > '${CMAKE_CURRENT_BINARY_DIR}/nuttx_olddefconfig.log'"
 	COMMAND ${CMAKE_COMMAND} -E copy_if_different ${NUTTX_DIR}/.config ${CMAKE_CURRENT_BINARY_DIR}/nuttx/.config
