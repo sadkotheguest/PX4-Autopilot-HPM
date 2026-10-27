@@ -1562,6 +1562,146 @@ void up_dshot_rxp_deinit(void)
 	dma_mgr_release_resource(&rxp_res);
 	rxp_allocated = false;
 }
+/* ---------------------------------------------------------------------- */
+/* Paired capture with a SINGLE DMA channel (source fixed burst)           */
+/* ---------------------------------------------------------------------- */
+/*
+ * The GPTMR raises one DMA request per captured edge.  With SRC_FIXBURST the
+ * DMA performs a 2-word burst starting at the configured source address and
+ * then returns to it, so every request writes the pair (CAPPOS, CAPNEG) into
+ * consecutive destinations - one DMA channel, no descriptor chain.
+ */
+
+#define DSHOT_RXF_EVENTS  48u
+#define DSHOT_RXF_CHANNEL 3u
+
+static uint32_t rxf_buf[DSHOT_RXF_EVENTS * 2u] __attribute__((section(".ahb_sram")));
+static dma_resource_t rxf_res;
+static dma_mgr_chn_conf_t rxf_conf;
+static bool rxf_allocated;
+
+int up_dshot_rxf_init(void)
+{
+	const unsigned pin = 9u;   /* PE09 */
+
+	clock_add_to_group(clock_gptmr0, 0);
+	clock_add_to_group(clock_hdma, 0);
+
+	HPM_IOC->PAD[IOC_PAD_PE09].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(17);
+	HPM_IOC->PAD[IOC_PAD_PE09].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
+
+	trgm_filter_t filter = {};
+	filter.mode = trgm_filter_mode_rapid_change;
+	filter.filter_length = 8;
+	trgm_filter_config(HPM_TRGM0, pin, &filter);
+
+	trgm_output_t out = {};
+	out.input = HPM_TRGM0_INPUT_SRC_TRGM0_P00 + pin;
+	out.type = trgm_output_same_as_input;
+	out.invert = false;
+	trgm_output_config(HPM_TRGM0, HPM_TRGM0_OUTPUT_SRC_GPTMR0_IN3, &out);
+
+	gptmr_channel_config_t cfg;
+	gptmr_channel_get_default_config(HPM_GPTMR0, &cfg);
+	cfg.mode = gptmr_work_mode_capture_at_both_edge;
+	cfg.dma_request_event = gptmr_dma_request_on_input_signal_toggle;
+
+	if (gptmr_channel_config(HPM_GPTMR0, DSHOT_RXF_CHANNEL, &cfg, false) != status_success) {
+		return -EIO;
+	}
+
+	gptmr_channel_enable_dma_request(HPM_GPTMR0, DSHOT_RXF_CHANNEL, true);
+
+	dma_mgr_init();
+
+	if (dma_mgr_request_resource(&rxf_res) != status_success) {
+		return -ENODEV;
+	}
+
+	rxf_allocated = true;
+
+	dma_mgr_get_default_chn_config(&rxf_conf);
+	rxf_conf.en_dmamux = true;
+	rxf_conf.dmamux_src = HPM_DMA_SRC_GPTMR0_3;
+	rxf_conf.src_mode = 1;
+	rxf_conf.dst_mode = 0;
+	rxf_conf.src_width = DMA_TRANSFER_WIDTH_WORD;
+	rxf_conf.dst_width = DMA_TRANSFER_WIDTH_WORD;
+	rxf_conf.src_addr_ctrl = 0;                       /* increment inside the burst */
+
+	rxf_conf.dst_addr_ctrl = 0;
+	rxf_conf.src_burst_size = DMA_NUM_TRANSFER_PER_BURST_2T;
+	rxf_conf.src_addr = (uint32_t)&HPM_GPTMR0->CHANNEL[DSHOT_RXF_CHANNEL].CAPPOS;
+	rxf_conf.dst_addr = (uint32_t)rxf_buf;
+	rxf_conf.size_in_byte = 2u * DSHOT_RXF_EVENTS * sizeof(uint32_t);
+	rxf_conf.en_infiniteloop = false;
+	rxf_conf.handshake_opt = DMA_HANDSHAKE_OPT_ONE_BURST;
+	rxf_conf.interrupt_mask = DMA_INTERRUPT_MASK_ALL & ~DMA_INTERRUPT_MASK_TERMINAL_COUNT;
+
+	if (dma_mgr_setup_channel(&rxf_res, &rxf_conf) != status_success) {
+		return -EIO;
+	}
+
+	/* dma_mgr does not expose this bit for HPM6E00, set it directly: the burst
+	 * then reads CAPPOS and CAPNEG and restarts from CAPPOS every request.
+	 */
+	rxf_res.base->CHCTRL[rxf_res.channel].CTRL |= DMAV2_CHCTRL_CTRL_SRC_FIXBURST_MASK;
+
+	return OK;
+}
+
+void up_dshot_rxf_start(void)
+{
+	if (!rxf_allocated) {
+		return;
+	}
+
+	gptmr_channel_reset_count(HPM_GPTMR0, DSHOT_RXF_CHANNEL);
+	gptmr_clear_status(HPM_GPTMR0, GPTMR_CH_CAP_STAT_MASK(DSHOT_RXF_CHANNEL));
+	memset(rxf_buf, 0, sizeof(rxf_buf));
+	dma_clear_transfer_status(rxf_res.base, rxf_res.channel);
+
+	if (dma_mgr_setup_channel(&rxf_res, &rxf_conf) != status_success) {
+		return;
+	}
+
+	rxf_res.base->CHCTRL[rxf_res.channel].CTRL |= DMAV2_CHCTRL_CTRL_SRC_FIXBURST_MASK;
+
+	dma_mgr_enable_channel(&rxf_res);
+	gptmr_start_counter(HPM_GPTMR0, DSHOT_RXF_CHANNEL);
+}
+
+void up_dshot_rxf_stop(void)
+{
+	if (!rxf_allocated) {
+		return;
+	}
+
+	gptmr_stop_counter(HPM_GPTMR0, DSHOT_RXF_CHANNEL);
+	dma_mgr_disable_channel(&rxf_res);
+}
+
+const uint32_t *up_dshot_rxf_buffer(void)
+{
+	return rxf_buf;
+}
+
+unsigned up_dshot_rxf_words(void)
+{
+	return DSHOT_RXF_EVENTS * 2u;
+}
+
+void up_dshot_rxf_deinit(void)
+{
+	if (!rxf_allocated) {
+		return;
+	}
+
+	gptmr_stop_counter(HPM_GPTMR0, DSHOT_RXF_CHANNEL);
+	dma_mgr_disable_channel(&rxf_res);
+	dma_mgr_release_resource(&rxf_res);
+	rxf_allocated = false;
+}
 /* Bidirectional DShot is not implemented yet; keep the API consistent. */
 int up_bdshot_num_erpm_ready(void) { return 0; }
 int up_bdshot_get_erpm(uint8_t channel, int *erpm) { (void)channel; if (erpm) { *erpm = 0; } return -ENOSYS; }

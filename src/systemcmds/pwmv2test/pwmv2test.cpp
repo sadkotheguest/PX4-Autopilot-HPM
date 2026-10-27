@@ -2525,6 +2525,143 @@ static int pollscan_run(unsigned rate_kbit, unsigned throttle_percent)
 
 	return (bits == 16u && frame == sent) ? 0 : 1;
 }
+/* ------------------------------------------------------------------------ */
+/* Single DMA channel, fixed source burst: one (CAPPOS, CAPNEG) pair per edge */
+/* ------------------------------------------------------------------------ */
+
+extern "C" int up_dshot_rxf_init(void);
+extern "C" void up_dshot_rxf_start(void);
+extern "C" void up_dshot_rxf_stop(void);
+extern "C" const uint32_t *up_dshot_rxf_buffer(void);
+extern "C" unsigned up_dshot_rxf_words(void);
+extern "C" void up_dshot_rxf_deinit(void);
+
+static int gcapf_run(unsigned rate_kbit, unsigned throttle_percent)
+{
+	up_dshot_rxf_deinit();
+	up_dshot_deinit();
+
+	if (up_dshot_init(0x1, rate_kbit * 1000u, false) != OK) {
+		PX4_ERR("gcapf: dshot init failed");
+		return 1;
+	}
+
+	if (up_dshot_rxf_init() != OK) {
+		PX4_ERR("gcapf: capture init failed");
+		return 1;
+	}
+
+	uint32_t throttle = 48u + throttle_percent * 2000u / 100u;
+
+	if (throttle > 2047u) {
+		throttle = 2047u;
+	}
+
+	const uint16_t packet = (uint16_t)((throttle << 1) & 0xFFFFu);
+	const uint16_t crc = (packet ^ (packet >> 4) ^ (packet >> 8)) & 0x0F;
+	const uint16_t sent = (uint16_t)((packet << 4) | crc);
+
+	dshot_motor_data_set(0, (uint16_t)throttle, false);
+	up_dshot_arm(true);
+	usleep(50);
+	up_dshot_tc_reset();
+	up_dshot_rxf_start();
+	usleep(50);
+	up_dshot_trigger();
+
+	uint32_t spin = 0;
+
+	while (spin++ < 2000000u && up_dshot_tc_count() == 0) {
+	}
+
+	usleep(200);
+	up_dshot_rxf_stop();
+	up_dshot_arm(false);
+
+	const uint32_t gclk = clock_get_frequency(clock_gptmr0);
+	const uint32_t bit_ticks = gclk / (rate_kbit * 1000u);
+	const uint32_t *buf = up_dshot_rxf_buffer();
+	const unsigned words = up_dshot_rxf_words();
+
+	uint32_t last_pos = 0xFFFFFFFFu, last_neg = 0xFFFFFFFFu;
+	uint32_t rise = 0;
+	bool have_rise = false;
+	uint16_t frame = 0;
+	unsigned bits = 0, edges = 0, pairs = 0;
+
+	for (unsigned i = 0; i + 1u < words; i += 2u) {
+		const uint32_t pos = buf[i];
+		const uint32_t neg = buf[i + 1u];
+
+		if (pos == 0u && neg == 0u) {
+			break;
+		}
+
+		pairs++;
+
+		const bool new_pos = (pos != last_pos);
+		const bool new_neg = (neg != last_neg);
+		last_pos = pos;
+		last_neg = neg;
+
+		for (unsigned e2 = 0; e2 < 2u; e2++) {
+			bool posedge;
+
+			if (new_pos && new_neg) {
+				posedge = (e2 == 0u) ? (pos < neg) : (pos >= neg);
+
+			} else if (new_pos) {
+				if (e2 > 0u) {
+					break;
+				}
+
+				posedge = true;
+
+			} else if (new_neg) {
+				if (e2 > 0u) {
+					break;
+				}
+
+				posedge = false;
+
+			} else {
+				break;
+			}
+
+			const uint32_t value = posedge ? pos : neg;
+
+			if (posedge) {
+				rise = value;
+				have_rise = true;
+				edges++;
+
+			} else if (have_rise) {
+				const uint32_t width = (value - rise) & 0xFFFFFFu;
+				have_rise = false;
+				edges++;
+
+				if (width == 0u || width > (bit_ticks + (bit_ticks / 2u))) {
+					continue;
+				}
+
+				if (bits < 16u) {
+					frame = (uint16_t)((frame << 1) | ((width > (bit_ticks / 2u)) ? 1u : 0u));
+					bits++;
+				}
+			}
+		}
+
+		if (bits >= 16u) {
+			break;
+		}
+	}
+
+	PX4_INFO("gcapf: %u kbit/s, thr %u, sent 0x%04x recv 0x%04x (%u bits, %u edges, %u pairs) -> %s",
+		 rate_kbit, (unsigned)throttle, (unsigned)sent, (unsigned)frame, bits, edges, pairs,
+		 (bits == 16u && frame == sent) ? "MATCH" : "MISMATCH");
+
+	return (bits == 16u && frame == sent) ? 0 : 1;
+}
 extern "C" int pwmv2test_main(int argc, char *argv[])
 {
 	uint32_t frequency = 1000;
@@ -2539,6 +2676,13 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 	unsigned dshot_rate = 600;
 	unsigned dshot_throttle = 0;
 	unsigned dshot_frames = 3000;   /* duration, ms */
+
+	if (argc > 1 && strcmp(argv[1], "gcapf") == 0) {
+		const unsigned rate = (argc > 2) ? strtoul(argv[2], nullptr, 0) : 600u;
+		const unsigned thr = (argc > 3) ? strtoul(argv[3], nullptr, 0) : 50u;
+
+		return gcapf_run(rate, thr);
+	}
 
 	if (argc > 1 && strcmp(argv[1], "pollscan") == 0) {
 		const unsigned rate = (argc > 2) ? strtoul(argv[2], nullptr, 0) : 50u;
