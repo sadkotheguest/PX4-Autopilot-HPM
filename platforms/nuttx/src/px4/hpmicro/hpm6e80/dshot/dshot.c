@@ -71,7 +71,12 @@
 #include "hpm_trgm_drv.h"
 #include "hpm_trgmmux_src.h"
 
-#define DSHOT_FRAME_WORDS   18u   /* bit1..bit15 + 3 idle words */
+/* 16 bit times: bit15 is preloaded into the shadow by software, the DMA
+ * writes bit14..bit0 (15 words) plus one idle word, like the STM32 port
+ * (CHANNEL_OUTPUT_BUFF_SIZE = 16 data + 1 gap).
+ */
+#define DSHOT_FRAME_WORDS   16u
+#define DSHOT_DATA_WORDS    15u
 
 static PWMV2_Type *const pwm = HPM_PWM1;
 
@@ -123,11 +128,14 @@ static uint32_t dshot_cmp(bool bit)
 
 static void dshot_build_buffer(void)
 {
-	for (int i = 1; i < 16; i++) {
-		frame_buf[i - 1] = dshot_cmp((frame_bits >> (15 - i)) & 1) << 8;
+	/* bit15 goes into the shadow before the counter starts, the DMA feeds the
+	 * remaining 15 bits and the idle word.
+	 */
+	for (int i = 0; i < (int)DSHOT_DATA_WORDS; i++) {
+		frame_buf[i] = dshot_cmp((frame_bits >> (14 - i)) & 1) << 8;
 	}
 
-	for (int i = 15; i < (int)DSHOT_FRAME_WORDS; i++) {
+	for (int i = DSHOT_DATA_WORDS; i < (int)DSHOT_FRAME_WORDS; i++) {
 		frame_buf[i] = reload << 8;
 	}
 }
@@ -329,6 +337,11 @@ void up_dshot_trigger(void)
 	pwmv2_reset_counter(pwm, counter);
 	pwmv2_enable_counter(pwm, counter);
 	pwmv2_start_pwm_output(pwm, counter);
+}
+
+unsigned up_dshot_frame_words(void)
+{
+	return DSHOT_FRAME_WORDS;
 }
 
 uint32_t up_dshot_tc_count(void)

@@ -292,6 +292,7 @@ extern "C" void dshot_motor_data_set(unsigned channel, uint16_t throttle, bool t
 extern "C" int up_dshot_arm(bool armed);
 extern "C" void up_dshot_trigger(void);
 extern "C" uint32_t up_dshot_tc_count(void);
+extern "C" unsigned up_dshot_frame_words(void);
 extern "C" void up_dshot_tc_reset(void);
 extern "C" void up_dshot_deinit(void);
 extern "C" void up_dshot_set_buffer_region(int region);
@@ -370,7 +371,7 @@ static int dshot_run(uint32_t clock, unsigned rate_kbit, unsigned throttle_perce
 	up_dshot_deinit();
 
 	PX4_INFO("dshot %u kbit/s, throttle %u (frame value), %u words, frames %u/%u",
-		 rate_kbit, (unsigned)throttle, (unsigned)DSHOT_FRAME_WORDS, complete, sent);
+		 rate_kbit, (unsigned)throttle, up_dshot_frame_words(), complete, sent);
 	PX4_INFO("trigger time: min %u us, avg %u us, max %u us (bit period %u us)",
 		 (unsigned)t_min, (unsigned)(t_sum / (sent ? sent : 1)), (unsigned)t_max,
 		 (unsigned)(1000000u / rate_hz));
