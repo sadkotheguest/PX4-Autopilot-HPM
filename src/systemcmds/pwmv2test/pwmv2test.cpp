@@ -228,6 +228,149 @@ static int dshot_dump(uint32_t clock, unsigned rate_kbit, unsigned throttle_perc
 	return 0;
 }
 
+/* ------------------------------------------------------------------------ */
+/* DMA diagnostics: same PWM trigger, destination either RAM or SHADOW_VAL   */
+/* ------------------------------------------------------------------------ */
+
+static uint32_t diag_src[64];
+static uint32_t diag_dst[64];
+
+static int dmadiag_run(uint32_t clock, unsigned freq_hz, unsigned words, const char *dest_name)
+{
+	const bool mem_xdma = (strcmp(dest_name, "memcpyxdma") == 0);
+	const bool mem_only = (strcmp(dest_name, "memcpy") == 0) || mem_xdma;
+	const bool to_ram = (strcmp(dest_name, "ram") == 0) || mem_only;
+	const bool to_shadow = (strcmp(dest_name, "shadow") == 0);
+	const bool use_xdma = (strcmp(dest_name, "shadowxdma") == 0) || mem_xdma;
+
+	if (freq_hz == 0 || words == 0 || words > 64 || (!to_ram && !to_shadow && !use_xdma && !mem_only)) {
+		PX4_ERR("usage: pwmv2test dmadiag <freq_hz> <words> <ram|shadow|shadowxdma>");
+		return 1;
+	}
+
+	DMAV2_Type *dma = use_xdma ? HPM_XDMA : HPM_HDMA;
+	const uint32_t reload = clock / freq_hz - 1;
+
+	HPM_IOC->PAD[IOC_PAD_PE08].FUNC_CTL = IOC_PE08_FUNC_CTL_PWM1_P_0;
+	HPM_IOC->PAD[IOC_PAD_PE08].PAD_CTL = IOC_PAD_PAD_CTL_DS_SET(7) | IOC_PAD_PAD_CTL_SPD_SET(2);
+	HPM_IOC->PAD[IOC_PAD_PE09].FUNC_CTL = IOC_PE09_FUNC_CTL_PWM1_P_1;
+	HPM_IOC->PAD[IOC_PAD_PE09].PAD_CTL = IOC_PAD_PAD_CTL_DS_SET(7) | IOC_PAD_PAD_CTL_SPD_SET(2);
+
+	clock_add_to_group(clock_hdma, 0);
+
+	if (use_xdma) {
+		clock_add_to_group(clock_xdma, 0);
+	}
+
+	dma_reset(dma);
+	usleep(1000);
+	PX4_INFO("dmadiag: dma reset done, CHEN=0x%x", (unsigned)dma->CHEN);
+
+	memset(diag_dst, 0, sizeof(diag_dst));
+
+	for (unsigned i = 0; i < words; i++) {
+		diag_src[i] = 0x1000u + i;
+	}
+
+	/* PWM: period, 50 % duty on comparator 0, period edge on comparator 1. */
+	pwmv2_deinit(PWM_BASE);
+	pwmv2_shadow_register_unlock(PWM_BASE);
+
+	pwmv2_set_shadow_val(PWM_BASE, PWMV2_SHADOW_INDEX(0), reload, 0, false);
+	pwmv2_set_shadow_val(PWM_BASE, PWMV2_SHADOW_INDEX(1), reload / 2, 0, false);
+	pwmv2_set_shadow_val(PWM_BASE, PWMV2_SHADOW_INDEX(2), reload + 1, 0, false);
+
+	pwmv2_counter_select_data_offset_from_shadow_value(PWM_BASE, pwm_counter_0, PWMV2_SHADOW_INDEX(0));
+	pwmv2_counter_burst_disable(PWM_BASE, pwm_counter_0);
+	pwmv2_set_reload_update_time(PWM_BASE, pwm_counter_0, pwm_reload_update_on_shlk);
+
+	pwmv2_select_cmp_source(PWM_BASE, 0, cmp_value_from_shadow_val, PWMV2_SHADOW_INDEX(1));
+	pwmv2_select_cmp_source(PWM_BASE, 1, cmp_value_from_shadow_val, PWMV2_SHADOW_INDEX(2));
+	pwmv2_select_cmp_source(PWM_BASE, 2, cmp_value_from_shadow_val, PWMV2_SHADOW_INDEX(1));
+	pwmv2_select_cmp_source(PWM_BASE, 3, cmp_value_from_shadow_val, PWMV2_SHADOW_INDEX(2));
+
+	pwmv2_shadow_register_lock(PWM_BASE);
+	pwmv2_disable_four_cmp(PWM_BASE, pwm_channel_0);
+	pwmv2_channel_enable_output(PWM_BASE, pwm_channel_0);
+	pwmv2_channel_enable_output(PWM_BASE, pwm_channel_1);
+
+	pwmv2_reset_counter(PWM_BASE, pwm_counter_0);
+	pwmv2_enable_counter(PWM_BASE, pwm_counter_0);
+	pwmv2_start_pwm_output(PWM_BASE, pwm_counter_0);
+
+	if (!mem_only) {
+		trgm_dma_request_config(HPM_TRGM0, TRGM_DMACFG_0, HPM_TRGM0_DMA_SRC_PWM1_REQ0);
+		dmamux_config(HPM_DMAMUX, DMA_SOC_CHN_TO_DMAMUX_CHN(dma, 0), HPM_DMA_SRC_MOT_0, true);
+		pwmv2_enable_dma_at_reload_point(PWM_BASE, pwm_dma_0, pwm_counter_0);
+	}
+
+	dma_handshake_config_t hs = {0};
+	hs.ch_index = 0;
+	hs.src = (uint32_t)diag_src;
+	hs.dst = to_ram ? (uint32_t)diag_dst : (uint32_t)&PWM_BASE->SHADOW_VAL[PWMV2_SHADOW_INDEX(1)];
+	hs.size_in_byte = words * 4u;
+	hs.data_width = DMA_TRANSFER_WIDTH_WORD;
+	hs.src_fixed = false;
+	hs.dst_fixed = !to_ram || mem_only;
+	hs.src_fixed = false;
+	hs.en_infiniteloop = false;
+	hs.interrupt_mask = 0;
+
+	PX4_INFO("dmadiag: %s, %u Hz (reload %u), %u words, %s, dst 0x%08x",
+		 dest_name, freq_hz, (unsigned)reload, words, use_xdma ? "XDMA" : "HDMA",
+		 (unsigned)hs.dst);
+
+	dma_disable_channel(dma, 0);
+	dma_clear_transfer_status(dma, 0);
+	PX4_INFO("dmadiag: arming channel");
+	dma_setup_handshake(dma, &hs, false);
+	dma_set_handshake_option(dma, 0, DMA_HANDSHAKE_OPT_ONE_BURST);
+	dma_enable_channel(dma, 0);
+	PX4_INFO("dmadiag: armed, waiting TC");
+
+	uint32_t spin = 0;
+	bool tc = false;
+
+	while (spin++ < 5000000u) {
+		if (dma_check_transfer_status(dma, 0) & DMA_CHANNEL_STATUS_TC) {
+			tc = true;
+			break;
+		}
+	}
+
+	const uint32_t status = dma_check_transfer_status(dma, 0);
+
+	dma_disable_channel(dma, 0);
+	dma_clear_transfer_status(dma, 0);
+	pwmv2_disable_dma_at_reload_point(PWM_BASE, pwm_dma_0);
+	pwmv2_disable_counter(PWM_BASE, pwm_counter_0);
+	pwmv2_channel_disable_output(PWM_BASE, pwm_channel_0);
+	pwmv2_channel_disable_output(PWM_BASE, pwm_channel_1);
+
+	PX4_INFO("dmadiag: tc %d, spin %u, status 0x%x", tc ? 1 : 0, (unsigned)spin, (unsigned)status);
+	PX4_INFO("dmadiag regs: CTRL=0x%08x TRANSIZE=%u SRC=0x%08x DST=0x%08x TCSTS=0x%x ERRSTS=0x%x",
+		 (unsigned)dma->CHCTRL[0].CTRL,
+		 (unsigned)DMAV2_CHCTRL_TRANSIZE_TRANSIZE_GET(dma->CHCTRL[0].TRANSIZE),
+		 (unsigned)DMAV2_CHCTRL_SRCADDR_SRCADDRL_GET(dma->CHCTRL[0].SRCADDR),
+		 (unsigned)DMAV2_CHCTRL_DSTADDR_DSTADDRL_GET(dma->CHCTRL[0].DSTADDR),
+		 (unsigned)dma->INTTCSTS, (unsigned)dma->INTERRSTS);
+
+	if (to_ram) {
+		unsigned ok = 0;
+
+		for (unsigned i = 0; i < words; i++) {
+			if (diag_dst[i] == diag_src[i]) {
+				ok++;
+			}
+		}
+
+		PX4_INFO("dmadiag: ram match %u/%u, dst[0..3] %u %u %u %u", ok, words,
+			 (unsigned)diag_dst[0], (unsigned)diag_dst[1],
+			 (unsigned)diag_dst[2], (unsigned)diag_dst[3]);
+	}
+
+	return tc ? 0 : 1;
+}
 static void dshot_pins(void)
 {
 	HPM_IOC->PAD[IOC_PAD_PE08].FUNC_CTL = IOC_PE08_FUNC_CTL_PWM1_P_0;
@@ -385,11 +528,28 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 	bool loop = false;
 	bool dshot = false;
 	bool dshotbuf = false;
+	bool dmadiag = false;
+	const char *dmadiag_dest = "ram";
 	unsigned dshot_rate = 600;
 	unsigned dshot_throttle = 0;
 	unsigned dshot_frames = 3000;   /* duration, ms */
 
-	if (argc > 1 && strcmp(argv[1], "dshotbuf") == 0) {
+	if (argc > 1 && strcmp(argv[1], "dmadiag") == 0) {
+		dmadiag = true;
+
+		if (argc > 2) {
+			dshot_rate = strtoul(argv[2], nullptr, 0);
+		}
+
+		if (argc > 3) {
+			dshot_throttle = strtoul(argv[3], nullptr, 0);
+		}
+
+		if (argc > 4) {
+			dmadiag_dest = argv[4];
+		}
+
+	} else if (argc > 1 && strcmp(argv[1], "dshotbuf") == 0) {
 		dshotbuf = true;
 
 		if (argc > 2) {
@@ -451,6 +611,10 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 	if (clock == 0) {
 		PX4_ERR("PWM1 clock is not running");
 		return 1;
+	}
+
+	if (dmadiag) {
+		return dmadiag_run(clock, dshot_rate, dshot_throttle, dmadiag_dest);
 	}
 
 	if (dshotbuf) {
