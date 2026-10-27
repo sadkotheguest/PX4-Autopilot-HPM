@@ -910,6 +910,25 @@ unsigned up_dshot_rxg_words(void)
 	return DSHOT_RXG_WORDS;
 }
 
+void up_dshot_rxg_dump(void)
+{
+	for (unsigned idx = 0; idx < rxg_count; idx++) {
+		if (((rxg_mask & (1u << idx)) == 0) || !rxg_allocated[idx]) {
+			continue;
+		}
+
+		const uint32_t ch = rxg_res[idx].channel;
+
+		PX4_INFO("rxgdump: idx %u base 0x%08x (HPM_DMAMUX 0x%08x) ch %u CTRL 0x%08x TRANSIZE 0x%08x SRC 0x%08x DST 0x%08x MUX 0x%08x CHEN 0x%08x",
+			 idx, (unsigned)(uintptr_t)rxg_res[idx].base, (unsigned)(uintptr_t)HPM_DMAMUX, (unsigned)ch,
+			 (unsigned)rxg_res[idx].base->CHCTRL[ch].CTRL,
+			 (unsigned)rxg_res[idx].base->CHCTRL[ch].TRANSIZE,
+			 (unsigned)rxg_res[idx].base->CHCTRL[ch].SRCADDR,
+			 (unsigned)rxg_res[idx].base->CHCTRL[ch].DSTADDR,
+			 (unsigned)HPM_DMAMUX->MUXCFG[DMA_SOC_CHN_TO_DMAMUX_CHN(rxg_res[idx].base, ch)],
+			 (unsigned)rxg_res[idx].base->CHEN);
+	}
+}
 void up_dshot_rxg_deinit(void)
 {
 	for (unsigned idx = 0; idx < rxg_count; idx++) {

@@ -1493,6 +1493,7 @@ extern "C" bool up_dshot_rxg_ready(void);
 extern "C" const uint32_t *up_dshot_rxg_buffer(unsigned channel);
 extern "C" unsigned up_dshot_rxg_words(void);
 extern "C" void up_dshot_rxg_deinit(void);
+extern "C" void up_dshot_rxg_dump(void);
 
 /* Capture one frame and decode the pulse widths (init must be done). */
 static bool gcap_measure(unsigned rate_kbit, unsigned throttle, uint16_t *sent_out,
@@ -2227,6 +2228,8 @@ static int gcapm_run(unsigned rate_kbit, unsigned throttle_percent)
 	usleep(50);
 	up_dshot_tc_reset();
 	up_dshot_rxg_start();
+	PX4_INFO("gcapm: single-shot path after start:");
+	up_dshot_rxg_dump();
 	usleep(50);
 	up_dshot_trigger();
 
@@ -2283,15 +2286,15 @@ static bool dshot_frame_crc_ok(uint16_t frame)
 	return (frame & 0x0F) == crc;
 }
 
-/* Find a run of plausible widths and rebuild the frame from it.  A run of 15
- * widths lacks the last bit (measure mode reports the previous pulse), so both
- * candidates are checked against the frame CRC.
+/* Find a run of plausible widths and rebuild the frame from it.  Measure mode
+ * reports the PREVIOUS pulse, so the trailing bits of the frame may be missing;
+ * they are recovered by trying every suffix against the frame CRC.
  */
 static bool gcapm_scan(const uint32_t *buf, unsigned words, uint32_t half,
 		       uint16_t *found, unsigned *offset)
 {
 	const uint32_t lo = half / 2u;
-	const uint32_t hi = half * 3u / 2u;
+	const uint32_t hi = half * 2u;
 	unsigned run_start = 0, run_len = 0;
 
 	for (unsigned i = 0; i <= words; i++) {
@@ -2305,7 +2308,7 @@ static bool gcapm_scan(const uint32_t *buf, unsigned words, uint32_t half,
 			run_len++;
 
 		} else {
-			if (run_len >= 15u) {
+			if (run_len >= 12u) {
 				break;
 			}
 
@@ -2313,32 +2316,24 @@ static bool gcapm_scan(const uint32_t *buf, unsigned words, uint32_t half,
 		}
 	}
 
-	if (run_len < 15u) {
+	if (run_len < 12u) {
 		return false;
 	}
 
+	const unsigned have = (run_len > 16u) ? 16u : run_len;
+	const unsigned missing = 16u - have;
 	uint16_t base = 0;
 
-	for (unsigned i = 0; i < 15u; i++) {
+	for (unsigned i = 0; i < have; i++) {
 		base = (uint16_t)((base << 1) | ((buf[run_start + i] > half) ? 1u : 0u));
 	}
 
-	if (run_len >= 16u) {
-		uint16_t frame = 0;
-
-		for (unsigned i = 0; i < 16u; i++) {
-			frame = (uint16_t)((frame << 1) | ((buf[run_start + i] > half) ? 1u : 0u));
-		}
-
-		if (dshot_frame_crc_ok(frame)) {
-			*found = frame;
-			*offset = run_start;
-			return true;
-		}
+	if (missing > 8u) {
+		return false;
 	}
 
-	for (unsigned bit = 0; bit < 2u; bit++) {
-		const uint16_t frame = (uint16_t)((base << 1) | bit);
+	for (unsigned tail = 0; tail < (1u << missing); tail++) {
+		const uint16_t frame = (uint16_t)((base << missing) | tail);
 
 		if (dshot_frame_crc_ok(frame)) {
 			*found = frame;
@@ -2391,6 +2386,12 @@ static int gcapmseq_run(unsigned rate_kbit)
 		dshot_motor_data_set(0, (uint16_t)thr, false);
 		up_dshot_tc_reset();
 		up_dshot_rxg_start();
+
+		if (k < 2u) {
+			PX4_INFO("gcapmseq: iteration %u after start:", k);
+			up_dshot_rxg_dump();
+		}
+
 		usleep(50);
 		up_dshot_trigger();
 
@@ -2406,6 +2407,10 @@ static int gcapmseq_run(unsigned rate_kbit)
 		const unsigned words = up_dshot_rxg_words();
 		uint16_t found = 0;
 		unsigned offset = 0;
+		PX4_INFO("gcapmseq: raw0..5 %u %u %u %u %u %u",
+			 (unsigned)buf[0], (unsigned)buf[1], (unsigned)buf[2],
+			 (unsigned)buf[3], (unsigned)buf[4], (unsigned)buf[5]);
+
 		const bool ok = (buf != nullptr) && gcapm_scan(buf, words, half, &found, &offset);
 		const bool match = ok && ((found >> 1) == (sent >> 1));
 
