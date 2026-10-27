@@ -200,3 +200,27 @@ registers only hold the last edge, and several edges may arrive between two
 polls), so the decode shows only the last pair.  Next step: replace the
 polling loop with the capture interrupt and a ring buffer, then decode the
 16 bits of the transmitted frame and compare them with `channel_frame[0]`.
+### Considered: toggling high-Z from the DMA
+
+Technically possible: the DMA can write peripheral registers (the TX path already
+writes SHADOW_VAL through DMA), so a descriptor with `dst = &PWM[ch].CFG1` and a
+precomputed value (`CFG1` with `HIGHZ_EN_N` cleared) would tri-state the pad
+without CPU involvement.  To time it correctly it needs its own trigger: an
+extra compare value at the end of the frame routed through a TRGM DMA output and
+a second DMAMUX/DMA channel; re-enabling for the next frame needs a second such
+event or one CPU write.
+
+Why it is not worth it:
+
+- the CPU already runs in the TC interrupt at exactly the right moment, so
+  `pwmv2_channel_disable_output()` there costs essentially nothing extra;
+- the per-frame CPU cost of the RMW writes is <1 us (see above);
+- DMA writes are full 32-bit values without read-modify-write, so the `CFG1`
+  shadow-configuration bits (polarity, dead zone, pair mode...) must be
+  duplicated and kept in sync with the PWM setup - a silent source of corruption;
+- it adds one comparator, one TRGM output and one DMA channel to debug.
+
+UM reference: `PWM_CFG1.HIGHZ_EN_N` (bit 28) - "0 to highz pwm outputs
+(pad_oe*=0), software need set this bit to 1 to enable pwm output".  The fault
+path can also tri-state the pin (`FAULT_MODE = 2'b1x` -> output high-Z), which is
+reserved for fault handling, not for the DShot reply window.
