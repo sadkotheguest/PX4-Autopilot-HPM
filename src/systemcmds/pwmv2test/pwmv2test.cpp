@@ -1641,6 +1641,17 @@ static int gcapseq_run(unsigned rate_kbit)
 
 		} else {
 			fail++;
+
+			const unsigned dump = (nw < 20u) ? nw : 20u;
+			char line[160];
+			int pos = 0;
+
+			for (unsigned k = 0; k < dump && pos < 140; k++) {
+				pos += snprintf(line + pos, sizeof(line) - pos, "%u ", (unsigned)widths[k]);
+			}
+
+			line[pos] = 0;
+			PX4_INFO("gcapseq:   widths: %s", line);
 		}
 	}
 

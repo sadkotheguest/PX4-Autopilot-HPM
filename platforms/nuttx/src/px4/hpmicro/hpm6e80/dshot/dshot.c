@@ -750,9 +750,10 @@ int up_dshot_rxg_init(uint32_t channel_mask)
 		HPM_IOC->PAD[IOC_PAD_PE08 + idx].PAD_CTL =
 			IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
 
+		/* Reject nanosecond glitches on the wire (DShot pulses are >= 400 ns). */
 		trgm_filter_t filter = {};
-		filter.mode = trgm_filter_mode_bypass;
-		filter.filter_length = 0;
+		filter.mode = trgm_filter_mode_rapid_change;
+		filter.filter_length = 8;
 		trgm_filter_config(HPM_TRGM0, pin, &filter);
 
 		/* TRGM.P[pin] -> GPTMRn_IN2/IN3 */
@@ -765,6 +766,7 @@ int up_dshot_rxg_init(uint32_t channel_mask)
 		gptmr_channel_config_t cfg;
 		gptmr_channel_get_default_config(m->gptmr, &cfg);
 		cfg.mode = gptmr_work_mode_measure_width;
+		cfg.cmp_initial_polarity_high = false;
 		cfg.dma_request_event = gptmr_dma_request_on_input_signal_toggle;
 
 		if (gptmr_channel_config(m->gptmr, m->channel, &cfg, false) != status_success) {
