@@ -1497,7 +1497,7 @@ extern "C" void up_dshot_rxg_deinit(void);
 /* Capture one frame and decode the pulse widths (init must be done). */
 static bool gcap_measure(unsigned rate_kbit, unsigned throttle, uint16_t *sent_out,
 			 uint16_t *recv_out, unsigned *bits_out, unsigned *edges_out,
-			 uint32_t *widths, unsigned *nwidths)
+			 uint32_t *widths, unsigned *nwidths, unsigned *dummy_out)
 {
 	const uint16_t packet = (uint16_t)((throttle << 1) & 0xFFFFu);
 	const uint16_t crc = (packet ^ (packet >> 4) ^ (packet >> 8)) & 0x0F;
@@ -1526,25 +1526,58 @@ static bool gcap_measure(unsigned rate_kbit, unsigned throttle, uint16_t *sent_o
 	uint16_t frame = 0;
 	unsigned bits = 0, edges = 0, nw = 0;
 
+	const uint32_t min_width = bit_ticks / 8u;
+	uint32_t valid[40];
+	unsigned nvalid = 0;
+
 	if (buf) {
-		for (unsigned i = 0; i < words; i++) {
+		for (unsigned i = 0; i < words && nvalid < 40u; i++) {
 			const uint32_t width = buf[i];
 
 			widths[nw++] = width;
 
-			if (width == 0u) {
-				continue;
-			}
-
-			edges++;
-
-			if (bits < 16u) {
-				frame = (uint16_t)((frame << 1) | ((width > (bit_ticks / 2u)) ? 1u : 0u));
-				bits++;
+			/* Ignore empty entries and sub-bit glitches. */
+			if (width > min_width) {
+				valid[nvalid++] = width;
 			}
 		}
 	}
 
+	/* The GPTMR measure event reports the width of the previous pulse and the
+	 * first entry may be a stale measurement, so try a few offsets.
+	 */
+	unsigned best_offset = 0;
+
+	for (unsigned offset = 0; offset < 6u; offset++) {
+		uint16_t candidate = 0;
+		unsigned cnt = 0;
+
+		for (unsigned i = offset; i < nvalid && cnt < 16u; i++) {
+			candidate = (uint16_t)((candidate << 1) | ((valid[i] > (bit_ticks / 2u)) ? 1u : 0u));
+			cnt++;
+		}
+
+		if (cnt == 16u && candidate == *sent_out) {
+			best_offset = offset;
+			break;
+		}
+	}
+
+	{
+		uint16_t candidate = 0;
+		unsigned cnt = 0;
+
+		for (unsigned i = best_offset; i < nvalid && cnt < 16u; i++) {
+			candidate = (uint16_t)((candidate << 1) | ((valid[i] > (bit_ticks / 2u)) ? 1u : 0u));
+			cnt++;
+		}
+
+		frame = candidate;
+		bits = cnt;
+		edges = nvalid;
+	}
+
+	*dummy_out = best_offset;
 	*recv_out = frame;
 	*bits_out = bits;
 	*edges_out = edges;
@@ -1582,10 +1615,11 @@ static int gcap_run(unsigned rate_kbit, unsigned throttle_percent)
 	uint16_t sent = 0, recv = 0;
 	unsigned bits = 0, edges = 0, nw = 0;
 	uint32_t widths[32] = {};
-	const bool match = gcap_measure(rate_kbit, throttle, &sent, &recv, &bits, &edges, widths, &nw);
+	unsigned offset = 0;
+	const bool match = gcap_measure(rate_kbit, throttle, &sent, &recv, &bits, &edges, widths, &nw, &offset);
 
-	PX4_INFO("gcap: %u kbit/s, thr %u, sent 0x%04x recv 0x%04x (%u bits, %u edges) -> %s",
-		 rate_kbit, (unsigned)throttle, (unsigned)sent, (unsigned)recv, bits, edges,
+	PX4_INFO("gcap: %u kbit/s, thr %u, sent 0x%04x recv 0x%04x (%u bits, %u edges, offset %u) -> %s",
+		 rate_kbit, (unsigned)throttle, (unsigned)sent, (unsigned)recv, bits, edges, offset,
 		 match ? "MATCH" : "MISMATCH");
 
 	for (unsigned i = 0; i < nw && i < 32u; i++) {
@@ -1630,10 +1664,11 @@ static int gcapseq_run(unsigned rate_kbit)
 		unsigned bits = 0, edges = 0, nw = 0;
 		uint32_t widths[32] = {};
 
-		const bool match = gcap_measure(rate_kbit, thr, &sent, &recv, &bits, &edges, widths, &nw);
+		unsigned offset = 0;
+		const bool match = gcap_measure(rate_kbit, thr, &sent, &recv, &bits, &edges, widths, &nw, &offset);
 
-		PX4_INFO("gcapseq: %3u%% thr %4u sent 0x%04x recv 0x%04x bits %2u edges %2u %s",
-			 throttles[i], (unsigned)thr, (unsigned)sent, (unsigned)recv, bits, edges,
+		PX4_INFO("gcapseq: %3u%% thr %4u sent 0x%04x recv 0x%04x bits %2u edges %2u off %u %s",
+			 throttles[i], (unsigned)thr, (unsigned)sent, (unsigned)recv, bits, edges, offset,
 			 match ? "MATCH" : "MISMATCH");
 
 		if (match) {

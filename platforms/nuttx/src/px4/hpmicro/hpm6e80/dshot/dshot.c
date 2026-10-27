@@ -81,8 +81,8 @@
 #include "hpm_trgmmux_src.h"
 
 /* 16 bit times per frame: bit15 preloaded, DMA sends bit14..bit0 + idle. */
-#define DSHOT_FRAME_WORDS   16u
-#define DSHOT_DATA_WORDS    15u
+#define DSHOT_FRAME_WORDS   17u   /* 16 data + trailing pulse */
+#define DSHOT_DATA_WORDS    16u
 
 #define DSHOT_MAX_CHANNELS  4u
 #define DSHOT_BIT_SLOT0     PWMV2_SHADOW_INDEX(20)   /* duty slots 20..23 */
@@ -399,12 +399,13 @@ void up_dshot_trigger(void)
 		return;
 	}
 
-	/* Preload bit 15 of every channel; the DMA sends bit14..bit0. */
+	/* Preload a dummy pulse: the first GPTMR measure event is consumed by the
+	 * pulse that is already on the wire when capture starts.
+	 */
 	pwmv2_shadow_register_unlock(pwm);
 
 	for (unsigned ch = 0; ch < num_channels; ch++) {
-		pwmv2_set_shadow_val(pwm, dshot_shadow(ch),
-				     dshot_cmp((channel_frame[ch] >> 15) & 1), 0, false);
+		pwmv2_set_shadow_val(pwm, dshot_shadow(ch), dshot_cmp(false), 0, false);
 	}
 
 	pwmv2_shadow_register_lock(pwm);
@@ -753,7 +754,7 @@ int up_dshot_rxg_init(uint32_t channel_mask)
 		/* Reject nanosecond glitches on the wire (DShot pulses are >= 400 ns). */
 		trgm_filter_t filter = {};
 		filter.mode = trgm_filter_mode_rapid_change;
-		filter.filter_length = 8;
+		filter.filter_length = 32;
 		trgm_filter_config(HPM_TRGM0, pin, &filter);
 
 		/* TRGM.P[pin] -> GPTMRn_IN2/IN3 */
