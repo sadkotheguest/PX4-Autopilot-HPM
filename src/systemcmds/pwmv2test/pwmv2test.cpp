@@ -126,16 +126,20 @@ static void pwm_apply(uint32_t clock, uint32_t frequency, unsigned duty_percent)
 
 	set_duty(reload, duty_percent);
 }
-
 /* ------------------------------------------------------------------------ */
 /* DShot bring-up: PWMv2 generates the bit stream, DMA feeds the duty shadow */
 /*                                                                          */
 /* Output: PE08 / PE09 = PWM1 channels 0 / 1 (motor header).  Both channels   */
-/* share one duty shadow and the period of counter 0, so they output the same */
-/* frame.                                                                    */
+/* share the duty shadow (slot 20) and the period of counter 0.              */
+/*                                                                          */
+/* One frame = one DMA transfer of 18 words (bit1..bit15 + 3 idle), one word  */
+/* per PWM period from the counter reload request.  The transfer is armed     */
+/* through dma_mgr (TC callback), the counter is started together with it and */
+/* stopped when the frame is complete.                                       */
 /* ------------------------------------------------------------------------ */
 
-static constexpr uint8_t DSHOT_GAP_BITS = 60;
+static constexpr uint8_t DSHOT_GAP_WORDS = 3;
+static constexpr uint8_t DSHOT_FRAME_WORDS = 15 + DSHOT_GAP_WORDS;
 
 static constexpr pwm_counter_t DSHOT_COUNTER = pwm_counter_0;
 static constexpr uint8_t DSHOT_CMP_DUTY0 = 0;   /* channel 0: duty */
@@ -143,10 +147,21 @@ static constexpr uint8_t DSHOT_CMP_EDGE0 = 1;   /* channel 0: period edge */
 static constexpr uint8_t DSHOT_CMP_DUTY1 = 2;   /* channel 1: duty */
 static constexpr uint8_t DSHOT_CMP_EDGE1 = 3;   /* channel 1: period edge */
 static constexpr uint8_t DSHOT_PERIOD_SHADOW = PWMV2_SHADOW_INDEX(0);
-static constexpr uint8_t DSHOT_DUTY_SHADOW = PWMV2_SHADOW_INDEX(1);
+static constexpr uint8_t DSHOT_DUTY_SHADOW = PWMV2_SHADOW_INDEX(20);
 static constexpr uint8_t DSHOT_EDGE_SHADOW = PWMV2_SHADOW_INDEX(2);
 
-static uint32_t dshot_buf[16 + DSHOT_GAP_BITS];
+/* DMA-visible buffer: AHB SRAM, like the SDK pwmv2_cal_shared_delta example. */
+static uint32_t dshot_buf[DSHOT_FRAME_WORDS] __attribute__((section(".ahb_sram")));
+
+static volatile uint32_t dshot_tc_count;
+
+static void dshot_tc_cb(DMA_Type *base, uint32_t channel, void *cb_data)
+{
+	(void)base;
+	(void)channel;
+	(void)cb_data;
+	dshot_tc_count++;
+}
 
 /* Comparator 0 counts down from the period: 75 % for a "1", 37.5 % for a "0". */
 static uint32_t dshot_cmp(uint32_t reload, bool bit)
@@ -171,7 +186,7 @@ static uint16_t dshot_frame_bits(unsigned throttle_percent)
 	return (uint16_t)((value << 4) | crc);
 }
 
-/* Build the cyclic DMA ring for one frame (same layout as dshot_run()). */
+/* Ring for one frame: bit 1..15, then idle words.  Bit 0 is preloaded. */
 static void dshot_fill_buf(uint32_t reload, unsigned throttle_percent)
 {
 	const uint16_t frame = dshot_frame_bits(throttle_percent);
@@ -180,11 +195,9 @@ static void dshot_fill_buf(uint32_t reload, unsigned throttle_percent)
 		dshot_buf[i - 1] = dshot_cmp(reload, (frame >> (15 - i)) & 1) << 8;
 	}
 
-	for (int i = 0; i < DSHOT_GAP_BITS; i++) {
-		dshot_buf[15 + i] = reload << 8;
+	for (int i = 15; i < DSHOT_FRAME_WORDS; i++) {
+		dshot_buf[i] = reload << 8;
 	}
-
-	dshot_buf[15 + DSHOT_GAP_BITS] = dshot_cmp(reload, (frame >> 15) & 1) << 8;
 }
 
 /* Offline check: frame bits and the DMA ring, no hardware access. */
@@ -206,9 +219,10 @@ static int dshot_dump(uint32_t clock, unsigned rate_kbit, unsigned throttle_perc
 
 	dshot_fill_buf(reload, throttle_percent);
 
-	PX4_INFO("frame 0x%04x (value %u, throttle %u%%), reload %u, cmp1 %u, cmp0 %u",
+	PX4_INFO("frame 0x%04x (value %u, throttle %u%%), reload %u, cmp1 %u, cmp0 %u, %u words",
 		 (unsigned)frame, (unsigned)(frame >> 4), throttle_percent, (unsigned)reload,
-		 (unsigned)dshot_cmp(reload, true), (unsigned)dshot_cmp(reload, false));
+		 (unsigned)dshot_cmp(reload, true), (unsigned)dshot_cmp(reload, false),
+		 (unsigned)DSHOT_FRAME_WORDS);
 
 	PX4_INFO("bits: %d%d%d%d %d%d%d%d %d%d%d%d %d%d%d%d",
 		 (frame >> 15) & 1, (frame >> 14) & 1, (frame >> 13) & 1, (frame >> 12) & 1,
@@ -216,26 +230,174 @@ static int dshot_dump(uint32_t clock, unsigned rate_kbit, unsigned throttle_perc
 		 (frame >> 7) & 1, (frame >> 6) & 1, (frame >> 5) & 1, (frame >> 4) & 1,
 		 (frame >> 3) & 1, (frame >> 2) & 1, (frame >> 1) & 1, frame & 1);
 
-	PX4_INFO("ring[0..7] cmp: %u %u %u %u %u %u %u %u",
+	PX4_INFO("ring cmp: %u %u %u %u %u %u %u %u | %u %u %u",
 		 (unsigned)(dshot_buf[0] >> 8), (unsigned)(dshot_buf[1] >> 8),
 		 (unsigned)(dshot_buf[2] >> 8), (unsigned)(dshot_buf[3] >> 8),
 		 (unsigned)(dshot_buf[4] >> 8), (unsigned)(dshot_buf[5] >> 8),
-		 (unsigned)(dshot_buf[6] >> 8), (unsigned)(dshot_buf[7] >> 8));
-	PX4_INFO("ring[15] gap cmp %u, ring[%u] bit0 cmp %u",
-		 (unsigned)(dshot_buf[15] >> 8), (unsigned)(15 + DSHOT_GAP_BITS),
-		 (unsigned)(dshot_buf[15 + DSHOT_GAP_BITS] >> 8));
+		 (unsigned)(dshot_buf[6] >> 8), (unsigned)(dshot_buf[7] >> 8),
+		 (unsigned)(dshot_buf[15] >> 8), (unsigned)(dshot_buf[16] >> 8),
+		 (unsigned)(dshot_buf[17] >> 8));
 
 	return 0;
+}
+
+static void dshot_pins(void)
+{
+	HPM_IOC->PAD[IOC_PAD_PE08].FUNC_CTL = IOC_PE08_FUNC_CTL_PWM1_P_0;
+	HPM_IOC->PAD[IOC_PAD_PE08].PAD_CTL = IOC_PAD_PAD_CTL_DS_SET(7) | IOC_PAD_PAD_CTL_SPD_SET(2);
+	HPM_IOC->PAD[IOC_PAD_PE09].FUNC_CTL = IOC_PE09_FUNC_CTL_PWM1_P_1;
+	HPM_IOC->PAD[IOC_PAD_PE09].PAD_CTL = IOC_PAD_PAD_CTL_DS_SET(7) | IOC_PAD_PAD_CTL_SPD_SET(2);
+}
+
+/* Configure the PWM for one frame; bit 0 is preloaded into the duty shadow. */
+static void dshot_pwm_frame(uint32_t reload, uint16_t frame)
+{
+	pwmv2_deinit(PWM_BASE);
+
+	/* DMA writes the duty shadow: unlock that slot (bit = 2 + slot). */
+	PWM_BASE->UNLOCK |= (1u << (2u + DSHOT_DUTY_SHADOW));
+
+	pwmv2_shadow_register_unlock(PWM_BASE);
+
+	pwmv2_set_shadow_val(PWM_BASE, DSHOT_PERIOD_SHADOW, reload, 0, false);
+	pwmv2_set_shadow_val(PWM_BASE, DSHOT_DUTY_SHADOW, dshot_cmp(reload, (frame >> 15) & 1), 0, false);
+	pwmv2_set_shadow_val(PWM_BASE, DSHOT_EDGE_SHADOW, reload + 1, 0, false);
+
+	pwmv2_counter_select_data_offset_from_shadow_value(PWM_BASE, DSHOT_COUNTER, DSHOT_PERIOD_SHADOW);
+	pwmv2_counter_burst_disable(PWM_BASE, DSHOT_COUNTER);
+	pwmv2_set_reload_update_time(PWM_BASE, DSHOT_COUNTER, pwm_reload_update_on_shlk);
+
+	pwmv2_select_cmp_source(PWM_BASE, DSHOT_CMP_DUTY0, cmp_value_from_shadow_val, DSHOT_DUTY_SHADOW);
+	pwmv2_select_cmp_source(PWM_BASE, DSHOT_CMP_EDGE0, cmp_value_from_shadow_val, DSHOT_EDGE_SHADOW);
+	pwmv2_select_cmp_source(PWM_BASE, DSHOT_CMP_DUTY1, cmp_value_from_shadow_val, DSHOT_DUTY_SHADOW);
+	pwmv2_select_cmp_source(PWM_BASE, DSHOT_CMP_EDGE1, cmp_value_from_shadow_val, DSHOT_EDGE_SHADOW);
+
+	pwmv2_shadow_register_lock(PWM_BASE);
+	pwmv2_issue_shadow_register_lock_event(PWM_BASE);
+
+	pwmv2_disable_four_cmp(PWM_BASE, pwm_channel_0);
+	pwmv2_channel_enable_output(PWM_BASE, pwm_channel_0);
+	pwmv2_channel_enable_output(PWM_BASE, pwm_channel_1);
+}
+
+static int dshot_run(uint32_t clock, unsigned rate_kbit, unsigned throttle_percent, unsigned frames)
+{
+	if (rate_kbit != 150 && rate_kbit != 300 && rate_kbit != 600) {
+		PX4_ERR("dshot rate must be 150, 300 or 600 kbit/s");
+		return 1;
+	}
+
+	if (throttle_percent > 100 || frames == 0) {
+		PX4_ERR("usage: pwmv2test dshot [150|300|600] [throttle_pct] [frames]");
+		return 1;
+	}
+
+	dshot_pins();
+	clock_add_to_group(clock_hdma, 0);
+
+	const uint32_t bit_ns = 1000000000u / (rate_kbit * 1000u);
+	const uint32_t reload = (uint32_t)((uint64_t)clock * bit_ns / 1000000000ULL) - 1;
+	const uint16_t frame = dshot_frame_bits(throttle_percent);
+
+	dshot_fill_buf(reload, throttle_percent);
+
+	trgm_dma_request_config(HPM_TRGM0, TRGM_DMACFG_0, HPM_TRGM0_DMA_SRC_PWM1_REQ0);
+
+	dma_mgr_init();
+
+	dma_resource_t res;
+
+	if (dma_mgr_request_resource(&res) != status_success) {
+		PX4_ERR("dshot: no DMA resource");
+		return 1;
+	}
+
+	dma_mgr_chn_conf_t conf;
+	dma_mgr_get_default_chn_config(&conf);
+	conf.en_dmamux = true;
+	conf.dmamux_src = HPM_DMA_SRC_MOT_0;
+	conf.src_mode = 0;
+	conf.dst_mode = 1;                        /* handshake: one word per PWM request */
+	conf.src_width = DMA_TRANSFER_WIDTH_WORD;
+	conf.dst_width = DMA_TRANSFER_WIDTH_WORD;
+	conf.src_addr_ctrl = 0;
+	conf.dst_addr_ctrl = 2;
+	conf.src_addr = (uint32_t)dshot_buf;
+	conf.dst_addr = (uint32_t)&PWM_BASE->SHADOW_VAL[DSHOT_DUTY_SHADOW];
+	conf.size_in_byte = sizeof(dshot_buf);
+	conf.en_infiniteloop = false;
+	conf.handshake_opt = DMA_HANDSHAKE_OPT_ONE_BURST;
+	conf.interrupt_mask = DMA_INTERRUPT_MASK_ALL & ~DMA_INTERRUPT_MASK_TERMINAL_COUNT;
+
+	dshot_tc_count = 0;
+	dma_mgr_install_chn_tc_callback(&res, dshot_tc_cb, NULL);
+
+	unsigned sent = 0, complete = 0;
+
+	for (unsigned f = 0; f < frames; f++) {
+		dshot_pwm_frame(reload, frame);
+		dshot_tc_count = 0;
+
+		if (dma_mgr_setup_channel(&res, &conf) != status_success) {
+			PX4_ERR("dshot: setup failed");
+			break;
+		}
+
+		if (dma_mgr_enable_channel(&res) != status_success) {
+			PX4_ERR("dshot: enable failed");
+			break;
+		}
+
+		pwmv2_reset_counter(PWM_BASE, DSHOT_COUNTER);
+		pwmv2_enable_counter(PWM_BASE, DSHOT_COUNTER);
+		pwmv2_enable_dma_at_reload_point(PWM_BASE, pwm_dma_0, DSHOT_COUNTER);
+		pwmv2_start_pwm_output(PWM_BASE, DSHOT_COUNTER);
+
+		uint32_t spin = 0;
+
+		while (spin++ < 5000000u && dshot_tc_count == 0) {
+		}
+
+		pwmv2_disable_dma_at_reload_point(PWM_BASE, pwm_dma_0);
+		pwmv2_disable_counter(PWM_BASE, DSHOT_COUNTER);
+
+		if (dshot_tc_count != 0) {
+			complete++;
+		}
+
+		sent++;
+		usleep(500);
+	}
+
+	dma_mgr_disable_channel(&res);
+	dma_mgr_release_resource(&res);
+	pwmv2_channel_disable_output(PWM_BASE, pwm_channel_0);
+	pwmv2_channel_disable_output(PWM_BASE, pwm_channel_1);
+
+	PX4_INFO("dshot PE08/PE09: %u kbit/s, throttle %u%%, reload %u, frame 0x%04x, %u words",
+		 rate_kbit, throttle_percent, (unsigned)reload, (unsigned)frame,
+		 (unsigned)DSHOT_FRAME_WORDS);
+	PX4_INFO("frames %u/%u complete, shadow20 %u, cnt %u",
+		 complete, sent, (unsigned)(PWM_BASE->SHADOW_VAL[DSHOT_DUTY_SHADOW] >> 8),
+		 (unsigned)PWM_BASE->CNT_VAL[DSHOT_COUNTER]);
+
+	return (complete == sent) ? 0 : 1;
 }
 
 /* ------------------------------------------------------------------------ */
 /* DMA diagnostics: same PWM trigger, destination either RAM or SHADOW_VAL   */
 /* ------------------------------------------------------------------------ */
 
-/* DMA buffers must live in AHB SRAM: the controllers cannot access the AXI
- * SRAM region where normal PX4 data lives (see the SDK example, which places
- * its buffer in .ahb_sram as well).
- */
+static volatile uint32_t diag_tc_count;
+
+static void diag_tc_cb(DMA_Type *base, uint32_t channel, void *cb_data)
+{
+	(void)base;
+	(void)channel;
+	(void)cb_data;
+	diag_tc_count++;
+}
+
 static uint32_t diag_src[64] __attribute__((section(".ahb_sram")));
 static uint32_t diag_dst[64] __attribute__((section(".ahb_sram")));
 
@@ -248,11 +410,10 @@ static int dmadiag_run(uint32_t clock, unsigned freq_hz, unsigned words, const c
 	const bool use_xdma = (strcmp(dest_name, "shadowxdma") == 0) || mem_xdma;
 
 	if (freq_hz == 0 || words == 0 || words > 64 || (!to_ram && !to_shadow && !use_xdma && !mem_only)) {
-		PX4_ERR("usage: pwmv2test dmadiag <freq_hz> <words> <ram|shadow|shadowxdma>");
+		PX4_ERR("usage: pwmv2test dmadiag <freq_hz> <words> <ram|shadow|shadowxdma|memcpy|memcpyxdma>");
 		return 1;
 	}
 
-	DMAV2_Type *dma = use_xdma ? HPM_XDMA : HPM_HDMA;
 	const uint32_t reload = clock / freq_hz - 1;
 
 	HPM_IOC->PAD[IOC_PAD_PE08].FUNC_CTL = IOC_PE08_FUNC_CTL_PWM1_P_0;
@@ -260,20 +421,8 @@ static int dmadiag_run(uint32_t clock, unsigned freq_hz, unsigned words, const c
 	HPM_IOC->PAD[IOC_PAD_PE09].FUNC_CTL = IOC_PE09_FUNC_CTL_PWM1_P_1;
 	HPM_IOC->PAD[IOC_PAD_PE09].PAD_CTL = IOC_PAD_PAD_CTL_DS_SET(7) | IOC_PAD_PAD_CTL_SPD_SET(2);
 
-	/* The DMA engine needs its bus clocks as well (see the SDK
-	 * init_board_clock() for hpm6e00evk).
-	 */
 	clock_add_to_group(clock_hdma, 0);
 	clock_add_to_group(clock_xdma, 0);
-	clock_add_to_group(clock_ahb0, 0);
-	clock_add_to_group(clock_axif, 0);
-	clock_add_to_group(clock_axis, 0);
-	clock_add_to_group(clock_axic, 0);
-	clock_add_to_group(clock_axin, 0);
-	clock_add_to_group(clock_ram0, 0);
-	clock_add_to_group(clock_ram1, 0);
-
-
 
 	memset(diag_dst, 0, sizeof(diag_dst));
 
@@ -281,7 +430,6 @@ static int dmadiag_run(uint32_t clock, unsigned freq_hz, unsigned words, const c
 		diag_src[i] = 0x1000u + i;
 	}
 
-	/* PWM: period, 50 % duty on comparator 0, period edge on comparator 1. */
 	pwmv2_deinit(PWM_BASE);
 	pwmv2_shadow_register_unlock(PWM_BASE);
 
@@ -310,63 +458,72 @@ static int dmadiag_run(uint32_t clock, unsigned freq_hz, unsigned words, const c
 	if (!mem_only) {
 		trgm_dma_request_config(HPM_TRGM0, TRGM_DMACFG_0, HPM_TRGM0_DMA_SRC_PWM1_REQ0);
 		pwmv2_enable_dma_at_reload_point(PWM_BASE, pwm_dma_0, pwm_counter_0);
+		/* Shadow registers are write protected: unlock bit = 2 + slot. */
+		PWM_BASE->UNLOCK |= (1u << (2u + PWMV2_SHADOW_INDEX(20)));
 	}
 
-	/* Memory-to-memory transfers should not use a peripheral request. */
-	dmamux_config(HPM_DMAMUX, DMA_SOC_CHN_TO_DMAMUX_CHN(dma, 0), HPM_DMA_SRC_MOT_0, !mem_only);
+	dma_mgr_init();
 
-	dma_handshake_config_t hs = {0};
-	hs.ch_index = 0;
-	hs.src = (uint32_t)diag_src;
-	hs.dst = to_ram ? (uint32_t)diag_dst : (uint32_t)&PWM_BASE->SHADOW_VAL[PWMV2_SHADOW_INDEX(1)];
-	hs.size_in_byte = words * 4u;
-	hs.data_width = DMA_TRANSFER_WIDTH_WORD;
-	hs.src_fixed = false;
-	hs.dst_fixed = !to_ram || mem_only;
-	hs.src_fixed = false;
-	hs.en_infiniteloop = false;
-	hs.interrupt_mask = 0;
+	dma_resource_t res;
 
-	PX4_INFO("dmadiag: %s, %u Hz (reload %u), %u words, %s, dst 0x%08x",
+	if ((use_xdma ? dma_mgr_request_specified_resource(&res, HPM_XDMA) : dma_mgr_request_resource(&res)) != status_success) {
+		PX4_ERR("dmadiag: no DMA resource");
+		return 1;
+	}
+
+	dma_mgr_chn_conf_t conf;
+	dma_mgr_get_default_chn_config(&conf);
+	conf.en_dmamux = !mem_only;
+	conf.dmamux_src = HPM_DMA_SRC_MOT_0;
+	conf.src_mode = 0;
+	conf.dst_mode = to_ram ? 0 : 1;
+	conf.src_width = DMA_TRANSFER_WIDTH_WORD;
+	conf.dst_width = DMA_TRANSFER_WIDTH_WORD;
+	conf.src_addr_ctrl = 0;
+	conf.dst_addr_ctrl = to_ram ? 0 : 2;
+	conf.src_addr = (uint32_t)diag_src;
+	conf.dst_addr = to_ram ? (uint32_t)diag_dst : (uint32_t)&PWM_BASE->SHADOW_VAL[PWMV2_SHADOW_INDEX(20)];
+	conf.size_in_byte = words * 4u;
+	conf.en_infiniteloop = false;
+	conf.handshake_opt = DMA_HANDSHAKE_OPT_ONE_BURST;
+	conf.interrupt_mask = DMA_INTERRUPT_MASK_ALL & ~DMA_INTERRUPT_MASK_TERMINAL_COUNT;
+
+	diag_tc_count = 0;
+	dma_mgr_install_chn_tc_callback(&res, diag_tc_cb, NULL);
+
+	PX4_INFO("dmadiag: %s, %u Hz (reload %u), %u words, %s ch %u, dst 0x%08x",
 		 dest_name, freq_hz, (unsigned)reload, words, use_xdma ? "XDMA" : "HDMA",
-		 (unsigned)hs.dst);
+		 (unsigned)res.channel, (unsigned)conf.dst_addr);
 
-	dma_disable_channel(dma, 0);
-	dma_clear_transfer_status(dma, 0);
-	PX4_INFO("dmadiag: arming channel");
-	dma_setup_handshake(dma, &hs, false);
-	dma_set_handshake_option(dma, 0, DMA_HANDSHAKE_OPT_ONE_BURST);
-	dma_enable_channel(dma, 0);
-	PX4_INFO("dmadiag: armed, waiting TC");
+	if (dma_mgr_setup_channel(&res, &conf) != status_success) {
+		PX4_ERR("dmadiag: setup failed");
+		dma_mgr_release_resource(&res);
+		return 1;
+	}
+
+	if (dma_mgr_enable_channel(&res) != status_success) {
+		PX4_ERR("dmadiag: enable failed");
+		dma_mgr_release_resource(&res);
+		return 1;
+	}
 
 	uint32_t spin = 0;
-	bool tc = false;
 
-	while (spin++ < 5000000u) {
-		if (dma_check_transfer_status(dma, 0) & DMA_CHANNEL_STATUS_TC) {
-			tc = true;
-			break;
-		}
+	while (spin++ < 5000000u && diag_tc_count == 0) {
 	}
 
-	const uint32_t status = dma_check_transfer_status(dma, 0);
-	const uint32_t ctrl_before = dma->CHCTRL[0].CTRL;
-	const uint32_t chen_before = dma->CHEN;
+	const bool tc = (diag_tc_count != 0);
+	const uint32_t ctrl_before = res.base->CHCTRL[res.channel].CTRL;
 
-	dma_disable_channel(dma, 0);
-	dma_clear_transfer_status(dma, 0);
+	dma_mgr_disable_channel(&res);
+	dma_mgr_release_resource(&res);
 	pwmv2_disable_dma_at_reload_point(PWM_BASE, pwm_dma_0);
 	pwmv2_disable_counter(PWM_BASE, pwm_counter_0);
 	pwmv2_channel_disable_output(PWM_BASE, pwm_channel_0);
 	pwmv2_channel_disable_output(PWM_BASE, pwm_channel_1);
 
-	PX4_INFO("dmadiag: tc %d, spin %u, status 0x%x", tc ? 1 : 0, (unsigned)spin, (unsigned)status);
-	PX4_INFO("dmadiag regs(before disable): CTRL=0x%08x CHEN=0x%x TRANSIZE=%u SRC=0x%08x DST=0x%08x TCSTS=0x%x ERRSTS=0x%x",
-		 (unsigned)ctrl_before, (unsigned)chen_before,
-		 (unsigned)DMAV2_CHCTRL_TRANSIZE_TRANSIZE_GET(dma->CHCTRL[0].TRANSIZE),
-		 (unsigned)DMAV2_CHCTRL_SRCADDR_SRCADDRL_GET(dma->CHCTRL[0].SRCADDR),
-		 (unsigned)DMAV2_CHCTRL_DSTADDR_DSTADDRL_GET(dma->CHCTRL[0].DSTADDR),
-		 (unsigned)dma->INTTCSTS, (unsigned)dma->INTERRSTS);
+	PX4_INFO("dmadiag: tc %d (cb %u), spin %u, CTRL=0x%08x", tc ? 1 : 0,
+		 (unsigned)diag_tc_count, (unsigned)spin, (unsigned)ctrl_before);
 
 	if (to_ram) {
 		unsigned ok = 0;
@@ -383,155 +540,6 @@ static int dmadiag_run(uint32_t clock, unsigned freq_hz, unsigned words, const c
 	}
 
 	return tc ? 0 : 1;
-}
-static void dshot_pins(void)
-{
-	HPM_IOC->PAD[IOC_PAD_PE08].FUNC_CTL = IOC_PE08_FUNC_CTL_PWM1_P_0;
-	HPM_IOC->PAD[IOC_PAD_PE08].PAD_CTL = IOC_PAD_PAD_CTL_DS_SET(7) | IOC_PAD_PAD_CTL_SPD_SET(2);
-	HPM_IOC->PAD[IOC_PAD_PE09].FUNC_CTL = IOC_PE09_FUNC_CTL_PWM1_P_1;
-	HPM_IOC->PAD[IOC_PAD_PE09].PAD_CTL = IOC_PAD_PAD_CTL_DS_SET(7) | IOC_PAD_PAD_CTL_SPD_SET(2);
-}
-
-static int dshot_run(uint32_t clock, unsigned rate_kbit, unsigned throttle_percent, unsigned frames)
-{
-	if (rate_kbit != 150 && rate_kbit != 300 && rate_kbit != 600) {
-		PX4_ERR("dshot rate must be 150, 300 or 600 kbit/s");
-		return 1;
-	}
-
-	if (throttle_percent > 100 || frames == 0) {
-		PX4_ERR("usage: pwmv2test dshot [150|300|600] [throttle_pct] [duration_ms]");
-		return 1;
-	}
-
-	dshot_pins();
-
-	/* Bit period in counter ticks. */
-	const uint32_t bit_ns = 1000000000u / (rate_kbit * 1000u);
-	const uint32_t reload = (uint32_t)((uint64_t)clock * bit_ns / 1000000000ULL) - 1;
-	const uint16_t frame = dshot_frame_bits(throttle_percent);
-
-	/* A value written by DMA at the end of period N is latched at reload N+1,
-	 * so bit 0 is preloaded and the buffer starts with bit 1.  The trailing
-	 * zero-duty entries provide the inter-frame gap; bit 0 is appended again
-	 * so that the cyclic buffer keeps every frame aligned.
-	 */
-	for (int i = 1; i < 16; i++) {
-		dshot_buf[i - 1] = dshot_cmp(reload, (frame >> (15 - i)) & 1) << 8;
-	}
-
-	for (int i = 0; i < DSHOT_GAP_BITS; i++) {
-		dshot_buf[15 + i] = reload << 8;
-	}
-
-	dshot_buf[15 + DSHOT_GAP_BITS] = dshot_cmp(reload, (frame >> 15) & 1) << 8;
-
-
-	pwmv2_deinit(PWM_BASE);
-	pwmv2_shadow_register_unlock(PWM_BASE);
-
-	pwmv2_set_shadow_val(PWM_BASE, DSHOT_PERIOD_SHADOW, reload, 0, false);
-	pwmv2_set_shadow_val(PWM_BASE, DSHOT_DUTY_SHADOW, dshot_cmp(reload, (frame >> 15) & 1), 0, false);
-	pwmv2_set_shadow_val(PWM_BASE, DSHOT_EDGE_SHADOW, reload + 1, 0, false);
-
-	pwmv2_counter_select_data_offset_from_shadow_value(PWM_BASE, DSHOT_COUNTER, DSHOT_PERIOD_SHADOW);
-	pwmv2_counter_burst_disable(PWM_BASE, DSHOT_COUNTER);
-	pwmv2_set_reload_update_time(PWM_BASE, DSHOT_COUNTER, pwm_reload_update_on_reload);
-
-	pwmv2_select_cmp_source(PWM_BASE, DSHOT_CMP_DUTY0, cmp_value_from_shadow_val, DSHOT_DUTY_SHADOW);
-	pwmv2_select_cmp_source(PWM_BASE, DSHOT_CMP_EDGE0, cmp_value_from_shadow_val, DSHOT_EDGE_SHADOW);
-	pwmv2_select_cmp_source(PWM_BASE, DSHOT_CMP_DUTY1, cmp_value_from_shadow_val, DSHOT_DUTY_SHADOW);
-	pwmv2_select_cmp_source(PWM_BASE, DSHOT_CMP_EDGE1, cmp_value_from_shadow_val, DSHOT_EDGE_SHADOW);
-
-	pwmv2_shadow_register_lock(PWM_BASE);
-
-	/* One DMA request per period: the counter 0 reload feeds pwm_dma_0. */
-	pwmv2_enable_dma_at_reload_point(PWM_BASE, pwm_dma_0, DSHOT_COUNTER);
-
-	pwmv2_disable_four_cmp(PWM_BASE, pwm_channel_0);
-	pwmv2_channel_enable_output(PWM_BASE, pwm_channel_0);
-	pwmv2_channel_enable_output(PWM_BASE, pwm_channel_1);
-
-	pwmv2_enable_counter(PWM_BASE, DSHOT_COUNTER);
-	pwmv2_start_pwm_output(PWM_BASE, DSHOT_COUNTER);
-
-	/* Route the PWM DMA request through TRGM to a DMAMUX source for HDMA. */
-	trgm_dma_request_config(HPM_TRGM0, TRGM_DMACFG_0, HPM_TRGM0_DMA_SRC_PWM1_REQ0);
-
-	dma_mgr_init();
-
-	dma_resource_t dma_res;
-
-	if (dma_mgr_request_resource(&dma_res) != status_success) {
-		PX4_ERR("no DMA channel");
-		return 1;
-	}
-
-	dma_mgr_chn_conf_t conf;
-	dma_mgr_get_default_chn_config(&conf);
-	conf.en_dmamux = true;
-	conf.dmamux_src = HPM_DMA_SRC_MOT_0;
-	conf.src_mode = 0;                      /* normal */
-	conf.dst_mode = 1;                      /* handshake */
-	conf.src_width = DMA_TRANSFER_WIDTH_WORD;
-	conf.dst_width = DMA_TRANSFER_WIDTH_WORD;
-	conf.src_addr_ctrl = 0;                 /* increment */
-	conf.dst_addr_ctrl = 2;                 /* fixed */
-	conf.size_in_byte = sizeof(dshot_buf);
-	conf.src_addr = (uint32_t)dshot_buf;
-	conf.dst_addr = (uint32_t)&PWM_BASE->SHADOW_VAL[DSHOT_DUTY_SHADOW];
-	conf.interrupt_mask = 0;
-	conf.en_infiniteloop = true;
-	conf.handshake_opt = DMA_HANDSHAKE_OPT_ONE_BURST;
-
-	if (dma_mgr_setup_channel(&dma_res, &conf) != status_success) {
-		PX4_ERR("dma_mgr_setup_channel failed");
-		return 1;
-	}
-
-	if (dma_mgr_enable_channel(&dma_res) != status_success) {
-		PX4_ERR("dma_mgr_enable_channel failed");
-		return 1;
-	}
-
-	PX4_INFO("conf: en_dmamux=%d src=0x%02x dst=0x%08x size=%u",
-		 (int)conf.en_dmamux, (unsigned)conf.dmamux_src,
-		 (unsigned)conf.dst_addr, (unsigned)conf.size_in_byte);
-
-
-	/* While the stream runs, sample the duty shadow: DMA must be cycling
-	 * through the "0" and "1" comparator values.
-	 */
-	uint32_t shadow_min = 0xFFFFFFFFu, shadow_max = 0;
-
-	for (unsigned ms = 0; ms < frames; ms++) {
-		const uint32_t shadow = PWM_BASE->SHADOW_VAL[DSHOT_DUTY_SHADOW] >> 8;
-
-		if (shadow < shadow_min) {
-			shadow_min = shadow;
-		}
-
-		if (shadow > shadow_max) {
-			shadow_max = shadow;
-		}
-
-		usleep(1000);
-	}
-
-	dma_mgr_disable_channel(&dma_res);
-	pwmv2_disable_counter(PWM_BASE, DSHOT_COUNTER);
-	pwmv2_channel_disable_output(PWM_BASE, pwm_channel_0);
-	pwmv2_channel_disable_output(PWM_BASE, pwm_channel_1);
-
-	PX4_INFO("dshot PE08/PE09 (PWM1 ch0/1): %u kbit/s, throttle %u%%, reload %u, frame 0x%04x, %u ms, DMA ch %d",
-		 rate_kbit, throttle_percent, (unsigned)reload, (unsigned)frame, frames, (int)dma_res.channel);
-	PX4_INFO("shadow min/max %u/%u (expect %u/%u), cnt %u", (unsigned)shadow_min, (unsigned)shadow_max,
-		 (unsigned)dshot_cmp(reload, false), (unsigned)dshot_cmp(reload, true),
-		 (unsigned)PWM_BASE->CNT_VAL[DSHOT_COUNTER]);
-	PX4_INFO("buf: %u %u %u ... %u", (unsigned)dshot_buf[0], (unsigned)dshot_buf[1],
-		 (unsigned)dshot_buf[2], (unsigned)dshot_buf[15 + DSHOT_GAP_BITS]);
-
-	return 0;
 }
 extern "C" int pwmv2test_main(int argc, char *argv[])
 {
