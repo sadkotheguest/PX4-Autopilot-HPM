@@ -36,23 +36,28 @@
  *
  * HPM6E00 DShot output on PWMv2.
  *
- * The API follows the STM32 port (stm32_common/dshot/dshot.c):
+ * API follows the STM32 port (stm32_common/dshot/dshot.c):
  *   up_dshot_init()           - one-time setup
- *   dshot_motor_data_set()    - prepare the frame for one motor
+ *   dshot_motor_data_set()    - prepare the frame of one motor
  *   up_dshot_trigger()        - send one frame
  *   up_dshot_arm()            - enable/disable the outputs
  *
- * A frame is a single 18-word DMA transfer into the PWM shadow registers
- * (bit 1..15 + 3 idle words; bit 0 is preloaded by software).  One DMA
- * request is generated per PWM period (counter reload), so one word is
- * written per bit.  The transfer-complete callback stops the counter.
+ * Frame layout mirrors STM32: the buffer is interleaved per motor
+ * (buffer[bit * num_channels + channel]) and one PWM request writes the duty
+ * shadows of ALL channels with one DMA burst, so a single DMA channel drives
+ * the whole timer.  The burst repeats for every bit through a chain of 16
+ * linked descriptors (one per bit period); the transfer-complete interrupt of
+ * the last descriptor stops the counter.
+ *
+ * bit15 of every motor is written to the shadow by software before the
+ * counter starts, the DMA feeds bit14..bit0 and one idle word.
  *
  * Hardware notes (learned during the bring-up):
- *  - the duty shadow slot must be unlocked for DMA (UNLOCK bit = 2 + slot);
+ *  - duty shadow slots must be unlocked for DMA (UNLOCK bit = 2 + slot);
  *  - the DMA channel must be allocated through dma_mgr, otherwise its TC
  *    interrupt is not acknowledged by dma_mgr_isr_handler() and the board
  *    hangs in an interrupt storm;
- *  - the frame buffer lives in .ahb_sram, which is non-cacheable.
+ *  - buffers and descriptors live in non-cacheable memory.
  */
 
 #include <px4_platform_common/px4_config.h>
@@ -71,45 +76,40 @@
 #include "hpm_trgm_drv.h"
 #include "hpm_trgmmux_src.h"
 
-/* 16 bit times: bit15 is preloaded into the shadow by software, the DMA
- * writes bit14..bit0 (15 words) plus one idle word, like the STM32 port
- * (CHANNEL_OUTPUT_BUFF_SIZE = 16 data + 1 gap).
- */
+/* 16 bit times per frame: bit15 preloaded, DMA sends bit14..bit0 + idle. */
 #define DSHOT_FRAME_WORDS   16u
 #define DSHOT_DATA_WORDS    15u
+
+#define DSHOT_MAX_CHANNELS  4u
+#define DSHOT_BIT_SLOT0     PWMV2_SHADOW_INDEX(20)   /* duty slots 20..23 */
 
 static PWMV2_Type *const pwm = HPM_PWM1;
 
 static const pwm_counter_t counter = pwm_counter_0;
-static const pwm_channel_t channel0 = pwm_channel_0;
-static const pwm_channel_t channel1 = pwm_channel_1;
 static const pwm_dma_chn_t dma_chn = pwm_dma_0;
 
-static const uint8_t cmp_duty0 = 0;
-static const uint8_t cmp_edge0 = 1;
-static const uint8_t cmp_duty1 = 2;
-static const uint8_t cmp_edge1 = 3;
+static const pwm_channel_t dshot_channels[DSHOT_MAX_CHANNELS] = {
+	pwm_channel_0, pwm_channel_1, pwm_channel_2, pwm_channel_3
+};
 
 static const uint8_t sh_period = PWMV2_SHADOW_INDEX(0);
-static const uint8_t sh_duty = PWMV2_SHADOW_INDEX(20);
 static const uint8_t sh_edge = PWMV2_SHADOW_INDEX(2);
 
-/* Non-cacheable DMA source buffers: AHB SRAM and the NONCACHEABLE_RAM region.
- * The region is selected with up_dshot_set_buffer_region() before init.
- */
-static uint32_t frame_buf_ahb[DSHOT_FRAME_WORDS] __attribute__((section(".ahb_sram")));
-static uint32_t frame_buf_nc[DSHOT_FRAME_WORDS] __attribute__((section(".noncacheable.bss")));
+/* Non-cacheable buffer, DMA source; the descriptors are read by the DMA. */
+static uint32_t frame_buf_ahb[DSHOT_FRAME_WORDS * DSHOT_MAX_CHANNELS]
+	__attribute__((section(".ahb_sram")));
+static uint32_t frame_buf_nc[DSHOT_FRAME_WORDS * DSHOT_MAX_CHANNELS]
+	__attribute__((section(".noncacheable.bss")));
+
+static dma_mgr_linked_descriptor_t dshot_desc[DSHOT_FRAME_WORDS]
+	__attribute__((section(".ahb_sram"))) __attribute__((aligned(8)));
 
 static uint32_t *frame_buf = frame_buf_ahb;
 
-void up_dshot_set_buffer_region(int region)
-{
-	frame_buf = region ? frame_buf_nc : frame_buf_ahb;
-}
-
 static uint32_t reload;
-static uint16_t frame_bits;
-static uint8_t channel_mask;
+static uint8_t channel_mask;      /* requested channels */
+static uint8_t num_channels;      /* burst size: 1, 2 or 4 */
+static uint16_t channel_frame[DSHOT_MAX_CHANNELS];
 static bool initialized;
 static bool armed;
 static volatile uint32_t tc_count;
@@ -118,25 +118,37 @@ static dma_resource_t dma_res;
 static dma_mgr_chn_conf_t dma_conf;
 static bool dma_allocated;
 
+void up_dshot_set_buffer_region(int region)
+{
+	frame_buf = region ? frame_buf_nc : frame_buf_ahb;
+}
+
+static uint8_t dshot_shadow(unsigned channel)
+{
+	return DSHOT_BIT_SLOT0 + channel;
+}
+
 static uint32_t dshot_cmp(bool bit)
 {
-	/* Comparator 0 counts down from the period: 75 % for "1", 37.5 % for "0". */
+	/* Comparator counts down from the period: 75 % for "1", 37.5 % for "0". */
 	const uint32_t duty = bit ? (reload * 3u / 4u) : (reload * 3u / 8u);
 
 	return reload - duty;
 }
 
-static void dshot_build_buffer(void)
+static void dshot_build_channel(unsigned channel)
 {
-	/* bit15 goes into the shadow before the counter starts, the DMA feeds the
-	 * remaining 15 bits and the idle word.
-	 */
-	for (int i = 0; i < (int)DSHOT_DATA_WORDS; i++) {
-		frame_buf[i] = dshot_cmp((frame_bits >> (14 - i)) & 1) << 8;
+	if (channel >= num_channels) {
+		return;
 	}
 
-	for (int i = DSHOT_DATA_WORDS; i < (int)DSHOT_FRAME_WORDS; i++) {
-		frame_buf[i] = reload << 8;
+	for (unsigned i = 0; i < DSHOT_DATA_WORDS; i++) {
+		frame_buf[i * num_channels + channel] =
+			dshot_cmp((channel_frame[channel] >> (14 - i)) & 1) << 8;
+	}
+
+	for (unsigned i = DSHOT_DATA_WORDS; i < DSHOT_FRAME_WORDS; i++) {
+		frame_buf[i * num_channels + channel] = reload << 8;
 	}
 }
 
@@ -152,37 +164,73 @@ static void dshot_tc_cb(DMA_Type *base, uint32_t channel, void *cb_data)
 
 static void dshot_pins(void)
 {
-	HPM_IOC->PAD[IOC_PAD_PE08].FUNC_CTL = IOC_PE08_FUNC_CTL_PWM1_P_0;
-	HPM_IOC->PAD[IOC_PAD_PE08].PAD_CTL = IOC_PAD_PAD_CTL_DS_SET(7) | IOC_PAD_PAD_CTL_SPD_SET(2);
-	HPM_IOC->PAD[IOC_PAD_PE09].FUNC_CTL = IOC_PE09_FUNC_CTL_PWM1_P_1;
-	HPM_IOC->PAD[IOC_PAD_PE09].PAD_CTL = IOC_PAD_PAD_CTL_DS_SET(7) | IOC_PAD_PAD_CTL_SPD_SET(2);
+	if (channel_mask & 0x1) {
+		HPM_IOC->PAD[IOC_PAD_PE08].FUNC_CTL = IOC_PE08_FUNC_CTL_PWM1_P_0;
+		HPM_IOC->PAD[IOC_PAD_PE08].PAD_CTL = IOC_PAD_PAD_CTL_DS_SET(7) | IOC_PAD_PAD_CTL_SPD_SET(2);
+	}
+
+	if (channel_mask & 0x2) {
+		HPM_IOC->PAD[IOC_PAD_PE09].FUNC_CTL = IOC_PE09_FUNC_CTL_PWM1_P_1;
+		HPM_IOC->PAD[IOC_PAD_PE09].PAD_CTL = IOC_PAD_PAD_CTL_DS_SET(7) | IOC_PAD_PAD_CTL_SPD_SET(2);
+	}
+
+	if (channel_mask & 0x4) {
+		HPM_IOC->PAD[IOC_PAD_PE10].FUNC_CTL = IOC_PE10_FUNC_CTL_PWM1_P_2;
+		HPM_IOC->PAD[IOC_PAD_PE10].PAD_CTL = IOC_PAD_PAD_CTL_DS_SET(7) | IOC_PAD_PAD_CTL_SPD_SET(2);
+	}
+
+	if (channel_mask & 0x8) {
+		HPM_IOC->PAD[IOC_PAD_PE11].FUNC_CTL = IOC_PE11_FUNC_CTL_PWM1_P_3;
+		HPM_IOC->PAD[IOC_PAD_PE11].PAD_CTL = IOC_PAD_PAD_CTL_DS_SET(7) | IOC_PAD_PAD_CTL_SPD_SET(2);
+	}
 }
 
 static void dshot_pwm_init(void)
 {
 	pwmv2_deinit(pwm);
 
-	/* The DMA writes the duty shadow: unlock that slot (bit = 2 + slot). */
-	pwm->UNLOCK |= (1u << (2u + sh_duty));
-
 	pwmv2_shadow_register_unlock(pwm);
+
+	for (unsigned ch = 0; ch < num_channels; ch++) {
+		const uint8_t shadow = dshot_shadow(ch);
+
+		/* DMA writes this shadow: unlock that slot (bit = 2 + slot). */
+		pwm->UNLOCK |= (1u << (2u + shadow));
+
+		pwmv2_set_shadow_val(pwm, shadow, reload, 0, false);
+		pwmv2_select_cmp_source(pwm, 2 * ch, cmp_value_from_shadow_val, shadow);
+		pwmv2_select_cmp_source(pwm, 2 * ch + 1, cmp_value_from_shadow_val, sh_edge);
+		pwmv2_disable_four_cmp(pwm, dshot_channels[ch]);
+	}
+
 	pwmv2_set_shadow_val(pwm, sh_period, reload, 0, false);
-	pwmv2_set_shadow_val(pwm, sh_duty, reload, 0, false);
 	pwmv2_set_shadow_val(pwm, sh_edge, reload + 1, 0, false);
 
 	pwmv2_counter_select_data_offset_from_shadow_value(pwm, counter, sh_period);
 	pwmv2_counter_burst_disable(pwm, counter);
 	pwmv2_set_reload_update_time(pwm, counter, pwm_reload_update_on_shlk);
 
-	pwmv2_select_cmp_source(pwm, cmp_duty0, cmp_value_from_shadow_val, sh_duty);
-	pwmv2_select_cmp_source(pwm, cmp_edge0, cmp_value_from_shadow_val, sh_edge);
-	pwmv2_select_cmp_source(pwm, cmp_duty1, cmp_value_from_shadow_val, sh_duty);
-	pwmv2_select_cmp_source(pwm, cmp_edge1, cmp_value_from_shadow_val, sh_edge);
-
 	pwmv2_shadow_register_lock(pwm);
 	pwmv2_issue_shadow_register_lock_event(pwm);
+}
 
-	pwmv2_disable_four_cmp(pwm, channel0);
+static void dshot_build_descriptors(void)
+{
+	for (unsigned k = 0; k < DSHOT_FRAME_WORDS; k++) {
+		dma_mgr_chn_conf_t conf = dma_conf;
+
+		conf.src_addr = (uint32_t)&frame_buf[k * num_channels];
+		conf.dst_addr = (uint32_t)&pwm->SHADOW_VAL[DSHOT_BIT_SLOT0];
+		conf.size_in_byte = num_channels * sizeof(uint32_t);
+		conf.linked_ptr = (k + 1 < DSHOT_FRAME_WORDS) ? (uint32_t)&dshot_desc[k + 1] : 0;
+		conf.interrupt_mask = (k + 1 == DSHOT_FRAME_WORDS)
+				      ? (DMA_INTERRUPT_MASK_ALL & ~DMA_INTERRUPT_MASK_TERMINAL_COUNT)
+				      : DMA_INTERRUPT_MASK_ALL;
+
+		if (dma_mgr_config_linked_descriptor(&dma_res, &conf, &dshot_desc[k]) != status_success) {
+			PX4_ERR("dshot: descriptor %u failed", k);
+		}
+	}
 }
 
 static int dshot_dma_init(void)
@@ -197,24 +245,27 @@ static int dshot_dma_init(void)
 
 	dma_allocated = true;
 
-	dma_mgr_chn_conf_t conf;
-	dma_mgr_get_default_chn_config(&conf);
-	conf.en_dmamux = true;
-	conf.dmamux_src = HPM_DMA_SRC_MOT_0;
-	conf.src_mode = 0;
-	conf.dst_mode = 1;                        /* one word per PWM request */
-	conf.src_width = DMA_TRANSFER_WIDTH_WORD;
-	conf.dst_width = DMA_TRANSFER_WIDTH_WORD;
-	conf.src_addr_ctrl = 0;                   /* increment */
-	conf.dst_addr_ctrl = 2;                   /* fixed: the duty shadow */
-	conf.src_addr = (uint32_t)frame_buf;
-	conf.dst_addr = (uint32_t)&pwm->SHADOW_VAL[sh_duty];
-	conf.size_in_byte = DSHOT_FRAME_WORDS * sizeof(uint32_t);
-	conf.en_infiniteloop = false;
-	conf.handshake_opt = DMA_HANDSHAKE_OPT_ONE_BURST;
-	conf.interrupt_mask = DMA_INTERRUPT_MASK_ALL & ~DMA_INTERRUPT_MASK_TERMINAL_COUNT;
+	dma_mgr_get_default_chn_config(&dma_conf);
+	dma_conf.en_dmamux = true;
+	dma_conf.dmamux_src = HPM_DMA_SRC_MOT_0;
+	dma_conf.src_mode = 0;
+	dma_conf.dst_mode = 1;                    /* one request -> one burst */
+	dma_conf.src_width = DMA_TRANSFER_WIDTH_WORD;
+	dma_conf.dst_width = DMA_TRANSFER_WIDTH_WORD;
+	dma_conf.src_addr_ctrl = 0;               /* increment */
+	dma_conf.dst_addr_ctrl = 0;               /* increment: burst writes 20..20+n-1 */
+	dma_conf.src_burst_size = (num_channels == 1) ? DMA_NUM_TRANSFER_PER_BURST_1T :
+				  (num_channels == 2) ? DMA_NUM_TRANSFER_PER_BURST_2T :
+				  DMA_NUM_TRANSFER_PER_BURST_4T;
+	dma_conf.src_addr = (uint32_t)frame_buf;
+	dma_conf.dst_addr = (uint32_t)&pwm->SHADOW_VAL[DSHOT_BIT_SLOT0];
+	dma_conf.size_in_byte = num_channels * sizeof(uint32_t);
+	dma_conf.linked_ptr = (uint32_t)&dshot_desc[0];
+	dma_conf.en_infiniteloop = false;
+	dma_conf.handshake_opt = DMA_HANDSHAKE_OPT_ONE_BURST;
+	dma_conf.interrupt_mask = DMA_INTERRUPT_MASK_ALL & ~DMA_INTERRUPT_MASK_TERMINAL_COUNT;
 
-	memcpy(&dma_conf, &conf, sizeof(dma_conf));
+	dshot_build_descriptors();
 
 	if (dma_mgr_setup_channel(&dma_res, &dma_conf) != status_success) {
 		return -EIO;
@@ -224,7 +275,7 @@ static int dshot_dma_init(void)
 		return -EIO;
 	}
 
-	/* The request itself is enabled once; it only fires while the counter runs. */
+	/* The request stays enabled; it only fires while the counter runs. */
 	pwmv2_enable_dma_at_reload_point(pwm, dma_chn, counter);
 
 	return OK;
@@ -242,11 +293,16 @@ int up_dshot_init(uint32_t channel_mask_in, unsigned dshot_pwm_freq, bool enable
 		return OK;
 	}
 
-	channel_mask = channel_mask_in ? (channel_mask_in & 0x3) : 0x1;
+	channel_mask = (uint8_t)(channel_mask_in & 0xF);
 
 	if (channel_mask == 0) {
 		return -EINVAL;
 	}
+
+	/* The DMA burst is one word per channel; keep it a power of two. */
+	num_channels = (channel_mask & 0x3) == 0x3 ? 2 :
+		       (channel_mask & 0xC) ? 4 :
+		       (channel_mask & 0x2) ? 2 : 1;
 
 	dshot_pins();
 
@@ -261,8 +317,15 @@ int up_dshot_init(uint32_t channel_mask_in, unsigned dshot_pwm_freq, bool enable
 
 	reload = clock / dshot_pwm_freq - 1;
 
+	for (unsigned ch = 0; ch < DSHOT_MAX_CHANNELS; ch++) {
+		channel_frame[ch] = 0;      /* throttle 0 */
+	}
+
 	dshot_pwm_init();
-	dshot_build_buffer();
+
+	for (unsigned ch = 0; ch < num_channels; ch++) {
+		dshot_build_channel(ch);
+	}
 
 	const int ret = dshot_dma_init();
 
@@ -278,18 +341,16 @@ int up_dshot_init(uint32_t channel_mask_in, unsigned dshot_pwm_freq, bool enable
 
 void dshot_motor_data_set(unsigned channel, uint16_t throttle, bool telemetry)
 {
-	(void)channel;   /* both outputs share the same frame for now */
-
-	if (!initialized) {
+	if (!initialized || channel >= num_channels) {
 		return;
 	}
 
 	const uint16_t packet = (uint16_t)((throttle << 1) | (telemetry ? 1u : 0u));
 	const uint16_t crc = (packet ^ (packet >> 4) ^ (packet >> 8)) & 0x0F;
 
-	frame_bits = (uint16_t)((packet << 4) | crc);
+	channel_frame[channel] = (uint16_t)((packet << 4) | crc);
 
-	dshot_build_buffer();
+	dshot_build_channel(channel);
 }
 
 int up_dshot_arm(bool arm)
@@ -300,13 +361,13 @@ int up_dshot_arm(bool arm)
 
 	armed = arm;
 
-	if (arm) {
-		pwmv2_channel_enable_output(pwm, channel0);
-		pwmv2_channel_enable_output(pwm, channel1);
+	for (unsigned ch = 0; ch < num_channels; ch++) {
+		if (arm) {
+			pwmv2_channel_enable_output(pwm, dshot_channels[ch]);
 
-	} else {
-		pwmv2_channel_disable_output(pwm, channel0);
-		pwmv2_channel_disable_output(pwm, channel1);
+		} else {
+			pwmv2_channel_disable_output(pwm, dshot_channels[ch]);
+		}
 	}
 
 	return OK;
@@ -318,12 +379,17 @@ void up_dshot_trigger(void)
 		return;
 	}
 
-	/* Preload bit 0: the DMA writes the value for the next period. */
+	/* Preload bit 15 of every channel; the DMA sends bit14..bit0. */
 	pwmv2_shadow_register_unlock(pwm);
-	pwmv2_set_shadow_val(pwm, sh_duty, dshot_cmp((frame_bits >> 15) & 1), 0, false);
+
+	for (unsigned ch = 0; ch < num_channels; ch++) {
+		pwmv2_set_shadow_val(pwm, dshot_shadow(ch),
+				     dshot_cmp((channel_frame[ch] >> 15) & 1), 0, false);
+	}
+
 	pwmv2_shadow_register_lock(pwm);
 
-	/* Drop any stale completion status before arming the next frame. */
+	/* Re-arm the descriptor chain from its first node. */
 	dma_clear_transfer_status(dma_res.base, dma_res.channel);
 
 	if (dma_mgr_setup_channel(&dma_res, &dma_conf) != status_success) {
@@ -342,6 +408,11 @@ void up_dshot_trigger(void)
 unsigned up_dshot_frame_words(void)
 {
 	return DSHOT_FRAME_WORDS;
+}
+
+unsigned up_dshot_num_channels(void)
+{
+	return num_channels;
 }
 
 uint32_t up_dshot_tc_count(void)
@@ -366,8 +437,10 @@ void up_dshot_deinit(void)
 
 	pwmv2_disable_dma_at_reload_point(pwm, dma_chn);
 	pwmv2_disable_counter(pwm, counter);
-	pwmv2_channel_disable_output(pwm, channel0);
-	pwmv2_channel_disable_output(pwm, channel1);
+
+	for (unsigned ch = 0; ch < num_channels; ch++) {
+		pwmv2_channel_disable_output(pwm, dshot_channels[ch]);
+	}
 
 	if (dma_allocated) {
 		dma_mgr_disable_channel(&dma_res);
