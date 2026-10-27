@@ -293,3 +293,43 @@ working edge-capture path.  For BDShot the plan becomes:
    it only if the GPTMR path has a drawback (e.g. not enough capture channels).
 
 The DShot transmit path is unaffected: it is verified and stays as is.
+### SDK survey: PWMv2 capture is not used anywhere, GPTMR capture is
+
+- No SDK code (drivers or samples) touches `CAPTURE_POS/CAPTURE_NEG` of PWMv2;
+  the only PWM capture sample (`samples/drivers/pwm/pwm_cap`) uses the v1
+  `pwm_*` API, which does not exist for the PWMv2 IP used by 6E00.  So PWMv2
+  input capture is effectively an untested path in the SDK, which matches our
+  failures.
+- Pin muxing: `PE09` has `IOC_PE09_FUNC_CTL_GPTMR0_CAPT_1`
+  (PE08/PE10 only expose `GPTMR0_COMP_*`), i.e. the DShot wire can be fed into
+  a GPTMR capture input on the same pad.
+- GPTMR capture is a supported, documented path (sample
+  `samples/drivers/gptmr/input_capture`): `gptmr_channel_config()` with
+  `gptmr_work_mode_capture_at_both_edge`, capture IRQ, and
+  `gptmr_channel_get_counter(..., gptmr_counter_type_rising_edge/falling_edge)`.
+
+### gptmrcap result
+
+Implemented `pwmv2test gptmrcap <rate> <throttle>`: PE08 sends the DShot frame,
+PE09 = GPTMR0_CAPT_1, both-edge capture, 100 MHz GPTMR clock.
+
+    600 kbit/s: bit = 166 ticks, 32 edges, widths seen 125 ticks (= 75 %, "1")
+    150 kbit/s: bit = 666 ticks, widths 250 ticks (= 37.5 %, "0")
+
+So the capture hardware and the tick resolution are fine, but the ISR-driven
+edge collection loses/misorders edges when the spacing gets short (at 600 kbit
+a "1" pulse is 125 ticks and the gap to the next edge is only 41 ticks = 410 ns,
+which is shorter than the interrupt latency), and at 150 kbit the decoded frame
+does not match yet either (all widths read as "0").
+
+Next steps for the receive path:
+
+1. Use the GPTMR **measure** modes (`gptmr_work_mode_measure_width`,
+   `gptmr_counter_type_measured_period/duty_cycle`) so the hardware latches the
+   pulse length itself; then one capture event per bit instead of two, and a
+   late ISR only loses a bit instead of corrupting the pairing.
+2. Check whether GPTMR capture can raise a DMA request, so the captured values
+   are moved by DMA (no per-edge CPU work) - this is the STM32-like solution.
+3. Re-verify the decoded bits against a scope trace before trusting the decoder:
+   the widths seen at 150 kbit all equal 37.5 % of the bit time, which hints at
+   an ordering/selection problem rather than at the transmitter.

@@ -63,6 +63,7 @@
 
 #include "hpm_pwmv2_drv.h"
 #include "hpm_clock_drv.h"
+#include "hpm_soc_irq.h"
 #include "hpm_ioc_regs.h"
 #include "hpm_iomux.h"
 #include "hpm_dma_mgr.h"
@@ -808,6 +809,181 @@ static int capdiag_run(void)
 
 	return 0;
 }
+/* ------------------------------------------------------------------------ */
+/* GPTMR input capture: PE08 sends DShot, PE09 = GPTMR0_CAPT_1 (jumper).     */
+/* ------------------------------------------------------------------------ */
+
+#include "hpm_gptmr_drv.h"
+
+#define GPTMRC_GPTMR      HPM_GPTMR0
+#define GPTMRC_CH         1u
+#define GPTMRC_ENTRIES    128u
+
+struct gptmrc_entry {
+	uint32_t value;
+	uint8_t posedge;
+};
+
+static gptmrc_entry gptmrc_buf[GPTMRC_ENTRIES] __attribute__((section(".ahb_sram")));
+static volatile uint32_t gptmrc_head;
+static uint32_t gptmrc_last_rising;
+static uint32_t gptmrc_last_falling;
+
+static int gptmrc_isr(int irq, void *context, void *arg)
+{
+	(void)irq;
+	(void)context;
+	(void)arg;
+
+	if (gptmr_check_status(GPTMRC_GPTMR, GPTMR_CH_CAP_STAT_MASK(GPTMRC_CH))) {
+		gptmr_clear_status(GPTMRC_GPTMR, GPTMR_CH_CAP_STAT_MASK(GPTMRC_CH));
+
+		const uint32_t rising = gptmr_channel_get_counter(GPTMRC_GPTMR, GPTMRC_CH,
+				      gptmr_counter_type_rising_edge);
+		const uint32_t falling = gptmr_channel_get_counter(GPTMRC_GPTMR, GPTMRC_CH,
+				       gptmr_counter_type_falling_edge);
+
+		/* Only the register that actually changed belongs to this edge. */
+		if (rising != gptmrc_last_rising) {
+			gptmrc_last_rising = rising;
+
+			if (gptmrc_head < GPTMRC_ENTRIES) {
+				gptmrc_buf[gptmrc_head].value = rising;
+				gptmrc_buf[gptmrc_head].posedge = 1;
+				gptmrc_head++;
+			}
+		}
+
+		if (falling != gptmrc_last_falling) {
+			gptmrc_last_falling = falling;
+
+			if (gptmrc_head < GPTMRC_ENTRIES) {
+				gptmrc_buf[gptmrc_head].value = falling;
+				gptmrc_buf[gptmrc_head].posedge = 0;
+				gptmrc_head++;
+			}
+		}
+	}
+
+	return 0;
+}
+
+static int gptmrcap_run(unsigned rate_kbit, unsigned throttle_percent)
+{
+	if (rate_kbit != 150 && rate_kbit != 300 && rate_kbit != 600) {
+		PX4_ERR("usage: pwmv2test gptmrcap [150|300|600] [throttle_pct]");
+		return 1;
+	}
+
+	/* DShot transmitter on PE08. */
+	up_dshot_deinit();
+	up_dshot_set_buffer_region(0);
+
+	if (up_dshot_init(0x1, rate_kbit * 1000u, false) != OK) {
+		PX4_ERR("gptmrcap: dshot init failed");
+		return 1;
+	}
+
+	/* PE09 as GPTMR0 capture input 1. */
+	HPM_IOC->PAD[IOC_PAD_PE09].FUNC_CTL = IOC_PE09_FUNC_CTL_GPTMR0_CAPT_1;
+	HPM_IOC->PAD[IOC_PAD_PE09].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
+
+	clock_add_to_group(clock_gptmr0, 0);
+
+	gptmr_channel_config_t cfg;
+	gptmr_channel_get_default_config(GPTMRC_GPTMR, &cfg);
+	cfg.mode = gptmr_work_mode_capture_at_both_edge;
+
+	gptmr_enable_irq(GPTMRC_GPTMR, GPTMR_CH_CAP_IRQ_MASK(GPTMRC_CH));
+
+	if (gptmr_channel_config(GPTMRC_GPTMR, GPTMRC_CH, &cfg, false) != status_success) {
+		PX4_ERR("gptmrcap: channel config failed");
+		return 1;
+	}
+
+	irq_attach(HPM_IRQn_GPTMR0, gptmrc_isr, NULL);
+	up_enable_irq(HPM_IRQn_GPTMR0);
+
+	gptmr_channel_reset_count(GPTMRC_GPTMR, GPTMRC_CH);
+	gptmr_start_counter(GPTMRC_GPTMR, GPTMRC_CH);
+
+	const uint32_t gptmr_clk = clock_get_frequency(clock_gptmr0);
+
+	uint32_t throttle = 48u + throttle_percent * 2000u / 100u;
+
+	if (throttle > 2047u) {
+		throttle = 2047u;
+	}
+
+	dshot_motor_data_set(0, (uint16_t)throttle, false);
+	up_dshot_arm(true);
+	up_dshot_tc_reset();
+	gptmrc_head = 0;
+	gptmrc_last_rising = gptmr_channel_get_counter(GPTMRC_GPTMR, GPTMRC_CH, gptmr_counter_type_rising_edge);
+	gptmrc_last_falling = gptmr_channel_get_counter(GPTMRC_GPTMR, GPTMRC_CH, gptmr_counter_type_falling_edge);
+	up_dshot_trigger();
+
+	uint32_t spin = 0;
+
+	while (spin++ < 2000000u && up_dshot_tc_count() == 0) {
+	}
+
+	usleep(100);
+	gptmr_stop_counter(GPTMRC_GPTMR, GPTMRC_CH);
+	up_dshot_arm(false);
+
+	const uint16_t packet = (uint16_t)((throttle << 1) & 0xFFFFu);
+	const uint16_t crc = (packet ^ (packet >> 4) ^ (packet >> 8)) & 0x0F;
+	const uint16_t sent = (uint16_t)((packet << 4) | crc);
+
+	const uint32_t bit_ticks = gptmr_clk / (rate_kbit * 1000u);
+	uint16_t received = 0;
+	unsigned bits = 0;
+	uint32_t pos_value = 0;
+	bool have_pos = false;
+
+	for (uint32_t i = 0; i < gptmrc_head; i++) {
+		if (gptmrc_buf[i].posedge) {
+			pos_value = gptmrc_buf[i].value;
+			have_pos = true;
+			continue;
+		}
+
+		if (!have_pos) {
+			continue;
+		}
+
+		const uint32_t width = (gptmrc_buf[i].value - pos_value) & 0xFFFFFFu;
+
+		if (width > bit_ticks + (bit_ticks / 2u)) {
+			/* Mis-paired edge (the reply is at most one bit long). */
+			have_pos = false;
+			continue;
+		}
+
+		const bool bit = width > (bit_ticks / 2u);
+		received = (uint16_t)((received << 1) | (bit ? 1u : 0u));
+		bits++;
+		have_pos = false;
+
+		if (bits >= 16u) {
+			break;
+		}
+	}
+
+	PX4_INFO("gptmrcap: %u kbit/s (%u Hz, bit %u ticks), throttle %u, frame 0x%04x",
+		 rate_kbit, (unsigned)gptmr_clk, (unsigned)bit_ticks, (unsigned)throttle, (unsigned)sent);
+	PX4_INFO("gptmrcap: edges %u, %u bits decoded 0x%04x -> %s",
+		 (unsigned)gptmrc_head, bits, (unsigned)received,
+		 (bits == 16u && received == sent) ? "MATCH" : "MISMATCH");
+
+	for (uint32_t i = 0; i < gptmrc_head && i < 6u; i++) {
+		PX4_INFO("gptmrcap: [%u] %s %u", (unsigned)i, gptmrc_buf[i].posedge ? "pos" : "neg",
+			 (unsigned)gptmrc_buf[i].value);
+	}
+
+	return (bits == 16u && received == sent) ? 0 : 1;
+}
 extern "C" int pwmv2test_main(int argc, char *argv[])
 {
 	uint32_t frequency = 1000;
@@ -822,6 +998,21 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 	unsigned dshot_rate = 600;
 	unsigned dshot_throttle = 0;
 	unsigned dshot_frames = 3000;   /* duration, ms */
+
+	if (argc > 1 && strcmp(argv[1], "gptmrcap") == 0) {
+		unsigned rate = 600;
+		unsigned thr = 50;
+
+		if (argc > 2) {
+			rate = strtoul(argv[2], nullptr, 0);
+		}
+
+		if (argc > 3) {
+			thr = strtoul(argv[3], nullptr, 0);
+		}
+
+		return gptmrcap_run(rate, thr);
+	}
 
 	if (argc > 1 && strcmp(argv[1], "capdiag") == 0) {
 		return capdiag_run();
