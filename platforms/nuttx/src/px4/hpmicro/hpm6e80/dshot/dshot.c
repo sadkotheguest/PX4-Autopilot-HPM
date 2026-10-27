@@ -81,8 +81,8 @@
 #include "hpm_trgmmux_src.h"
 
 /* 16 bit times per frame: bit15 preloaded, DMA sends bit14..bit0 + idle. */
-#define DSHOT_FRAME_WORDS   19u   /* 16 data + trailing pulse + 2 idle */
-#define DSHOT_DATA_WORDS    16u
+#define DSHOT_FRAME_WORDS   16u   /* bit15 preloaded + bit14..bit0 + idle */
+#define DSHOT_DATA_WORDS    15u
 
 #define DSHOT_MAX_CHANNELS  4u
 #define DSHOT_BIT_SLOT0     PWMV2_SHADOW_INDEX(20)   /* duty slots 20..23 */
@@ -399,13 +399,12 @@ void up_dshot_trigger(void)
 		return;
 	}
 
-	/* Preload a dummy pulse: the first GPTMR measure event is consumed by the
-	 * pulse that is already on the wire when capture starts.
-	 */
+	/* Preload bit 15 of every channel; the DMA sends bit14..bit0. */
 	pwmv2_shadow_register_unlock(pwm);
 
 	for (unsigned ch = 0; ch < num_channels; ch++) {
-		pwmv2_set_shadow_val(pwm, dshot_shadow(ch), dshot_cmp(false), 0, false);
+		pwmv2_set_shadow_val(pwm, dshot_shadow(ch),
+				     dshot_cmp((channel_frame[ch] >> 15) & 1), 0, false);
 	}
 
 	pwmv2_shadow_register_lock(pwm);
@@ -1110,6 +1109,214 @@ void up_dshot_rx_deinit(void)
 	dma_mgr_release_resource(&rx_res);
 	rx_allocated = false;
 	rx_ready = false;
+}
+/* ---------------------------------------------------------------------- */
+/* GPTMR both-edge capture through TRGM, ISR based (reference receiver)    */
+/* ---------------------------------------------------------------------- */
+/*
+ * Each phase is timestamped by the GPTMR counter: CAPPOS on a rising edge,
+ * CAPNEG on a falling edge.  The ISR stores the counter value that changed,
+ * so the pulse width is simply (fall - rise) and no dummy pulses are needed.
+ */
+
+#define DSHOT_RXI_CHANNELS  2u
+#define DSHOT_RXI_ENTRIES   64u
+
+typedef struct {
+	GPTMR_Type *gptmr;
+	unsigned channel;
+	uint8_t trgm_output;
+} dshot_rxi_map_t;
+
+static const dshot_rxi_map_t rxi_map[DSHOT_RXI_CHANNELS] = {
+	{ HPM_GPTMR0, 2u, HPM_TRGM0_OUTPUT_SRC_GPTMR0_IN2 },
+	{ HPM_GPTMR0, 3u, HPM_TRGM0_OUTPUT_SRC_GPTMR0_IN3 },
+};
+
+typedef struct {
+	uint32_t value;
+	uint8_t channel;
+	uint8_t posedge;
+} dshot_rxi_entry_t;
+
+static dshot_rxi_entry_t rxi_buf[DSHOT_RXI_ENTRIES] __attribute__((section(".ahb_sram")));
+static volatile uint32_t rxi_head;
+static uint32_t rxi_last_pos[DSHOT_RXI_CHANNELS];
+static uint32_t rxi_last_neg[DSHOT_RXI_CHANNELS];
+static uint32_t rxi_mask;
+static bool rxi_attached;
+
+static void dshot_rxi_push(unsigned idx, bool posedge, uint32_t value)
+{
+	const uint32_t head = rxi_head;
+
+	if (head >= DSHOT_RXI_ENTRIES) {
+		return;
+	}
+
+	rxi_buf[head].value = value;
+	rxi_buf[head].channel = (uint8_t)idx;
+	rxi_buf[head].posedge = posedge ? 1u : 0u;
+	rxi_head = head + 1u;
+}
+
+static int dshot_rxi_isr(int irq, void *context, void *arg)
+{
+	(void)irq;
+	(void)context;
+	(void)arg;
+
+	for (unsigned idx = 0; idx < DSHOT_RXI_CHANNELS; idx++) {
+		if ((rxi_mask & (1u << idx)) == 0) {
+			continue;
+		}
+
+		const dshot_rxi_map_t *m = &rxi_map[idx];
+		const uint32_t mask = GPTMR_CH_CAP_STAT_MASK(m->channel);
+
+		if (!gptmr_check_status(m->gptmr, mask)) {
+			continue;
+		}
+
+		gptmr_clear_status(m->gptmr, mask);
+
+		const uint32_t pos = gptmr_channel_get_counter(m->gptmr, m->channel,
+				      gptmr_counter_type_rising_edge);
+		const uint32_t neg = gptmr_channel_get_counter(m->gptmr, m->channel,
+				      gptmr_counter_type_falling_edge);
+
+		const bool new_pos = (pos != rxi_last_pos[idx]);
+		const bool new_neg = (neg != rxi_last_neg[idx]);
+
+		rxi_last_pos[idx] = pos;
+		rxi_last_neg[idx] = neg;
+
+		/* If two edges were coalesced (slow ISR), store them in time order. */
+		if (new_pos && new_neg) {
+			if (pos < neg) {
+				dshot_rxi_push(idx, true, pos);
+				dshot_rxi_push(idx, false, neg);
+
+			} else {
+				dshot_rxi_push(idx, false, neg);
+				dshot_rxi_push(idx, true, pos);
+			}
+
+		} else if (new_pos) {
+			dshot_rxi_push(idx, true, pos);
+
+		} else if (new_neg) {
+			dshot_rxi_push(idx, false, neg);
+		}
+	}
+
+	return 0;
+}
+
+int up_dshot_rxi_init(uint32_t channel_mask)
+{
+	rxi_mask = channel_mask ? (channel_mask & ((1u << DSHOT_RXI_CHANNELS) - 1u)) : 1u;
+
+	clock_add_to_group(clock_gptmr0, 0);
+
+	for (unsigned idx = 0; idx < DSHOT_RXI_CHANNELS; idx++) {
+		if ((rxi_mask & (1u << idx)) == 0) {
+			continue;
+		}
+
+		const dshot_rxi_map_t *m = &rxi_map[idx];
+		const unsigned pin = 8u + idx;
+
+		HPM_IOC->PAD[IOC_PAD_PE08 + idx].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(17);
+		HPM_IOC->PAD[IOC_PAD_PE08 + idx].PAD_CTL =
+			IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
+
+		trgm_filter_t filter = {};
+		filter.mode = trgm_filter_mode_rapid_change;
+		filter.filter_length = 8;
+		trgm_filter_config(HPM_TRGM0, pin, &filter);
+
+		trgm_output_t out = {};
+		out.input = HPM_TRGM0_INPUT_SRC_TRGM0_P00 + pin;
+		out.type = trgm_output_same_as_input;
+		out.invert = false;
+		trgm_output_config(HPM_TRGM0, m->trgm_output, &out);
+
+		gptmr_channel_config_t cfg;
+		gptmr_channel_get_default_config(m->gptmr, &cfg);
+		cfg.mode = gptmr_work_mode_capture_at_both_edge;
+
+		if (gptmr_channel_config(m->gptmr, m->channel, &cfg, false) != status_success) {
+			return -EIO;
+		}
+
+		gptmr_enable_irq(m->gptmr, GPTMR_CH_CAP_IRQ_MASK(m->channel));
+	}
+
+	if (!rxi_attached) {
+		irq_attach(HPM_IRQn_GPTMR0, dshot_rxi_isr, NULL);
+		rxi_attached = true;
+	}
+
+	up_enable_irq(HPM_IRQn_GPTMR0);
+
+	return OK;
+}
+
+void up_dshot_rxi_reset(void)
+{
+	rxi_head = 0;
+
+	for (unsigned idx = 0; idx < DSHOT_RXI_CHANNELS; idx++) {
+		rxi_last_pos[idx] = 0xFFFFFFFFu;
+		rxi_last_neg[idx] = 0xFFFFFFFFu;
+	}
+}
+
+void up_dshot_rxi_enable(bool enable)
+{
+	for (unsigned idx = 0; idx < DSHOT_RXI_CHANNELS; idx++) {
+		if ((rxi_mask & (1u << idx)) == 0) {
+			continue;
+		}
+
+		const dshot_rxi_map_t *m = &rxi_map[idx];
+
+		if (enable) {
+			gptmr_clear_status(m->gptmr, GPTMR_CH_CAP_STAT_MASK(m->channel));
+			gptmr_channel_reset_count(m->gptmr, m->channel);
+			gptmr_start_counter(m->gptmr, m->channel);
+
+		} else {
+			gptmr_stop_counter(m->gptmr, m->channel);
+		}
+	}
+}
+
+uint32_t up_dshot_rxi_count(void)
+{
+	return rxi_head;
+}
+
+bool up_dshot_rxi_get(uint32_t index, uint32_t *value, uint8_t *channel, bool *posedge)
+{
+	if (index >= rxi_head) {
+		return false;
+	}
+
+	if (value) {
+		*value = rxi_buf[index].value;
+	}
+
+	if (channel) {
+		*channel = rxi_buf[index].channel;
+	}
+
+	if (posedge) {
+		*posedge = rxi_buf[index].posedge != 0;
+	}
+
+	return true;
 }
 /* Bidirectional DShot is not implemented yet; keep the API consistent. */
 int up_bdshot_num_erpm_ready(void) { return 0; }
