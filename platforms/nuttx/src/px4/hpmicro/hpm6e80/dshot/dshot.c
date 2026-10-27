@@ -89,8 +89,18 @@ static const uint8_t sh_period = PWMV2_SHADOW_INDEX(0);
 static const uint8_t sh_duty = PWMV2_SHADOW_INDEX(20);
 static const uint8_t sh_edge = PWMV2_SHADOW_INDEX(2);
 
-/* Non-cacheable buffer, DMA source. */
-static uint32_t frame_buf[DSHOT_FRAME_WORDS] __attribute__((section(".ahb_sram")));
+/* Non-cacheable DMA source buffers: AHB SRAM and the NONCACHEABLE_RAM region.
+ * The region is selected with up_dshot_set_buffer_region() before init.
+ */
+static uint32_t frame_buf_ahb[DSHOT_FRAME_WORDS] __attribute__((section(".ahb_sram")));
+static uint32_t frame_buf_nc[DSHOT_FRAME_WORDS] __attribute__((section(".noncacheable.bss")));
+
+static uint32_t *frame_buf = frame_buf_ahb;
+
+void up_dshot_set_buffer_region(int region)
+{
+	frame_buf = region ? frame_buf_nc : frame_buf_ahb;
+}
 
 static uint32_t reload;
 static uint16_t frame_bits;
@@ -191,7 +201,7 @@ static int dshot_dma_init(void)
 	conf.dst_addr_ctrl = 2;                   /* fixed: the duty shadow */
 	conf.src_addr = (uint32_t)frame_buf;
 	conf.dst_addr = (uint32_t)&pwm->SHADOW_VAL[sh_duty];
-	conf.size_in_byte = sizeof(frame_buf);
+	conf.size_in_byte = DSHOT_FRAME_WORDS * sizeof(uint32_t);
 	conf.en_infiniteloop = false;
 	conf.handshake_opt = DMA_HANDSHAKE_OPT_ONE_BURST;
 	conf.interrupt_mask = DMA_INTERRUPT_MASK_ALL & ~DMA_INTERRUPT_MASK_TERMINAL_COUNT;
@@ -305,6 +315,9 @@ void up_dshot_trigger(void)
 	pwmv2_set_shadow_val(pwm, sh_duty, dshot_cmp((frame_bits >> 15) & 1), 0, false);
 	pwmv2_shadow_register_lock(pwm);
 
+	/* Drop any stale completion status before arming the next frame. */
+	dma_clear_transfer_status(dma_res.base, dma_res.channel);
+
 	if (dma_mgr_setup_channel(&dma_res, &dma_conf) != status_success) {
 		return;
 	}
@@ -326,6 +339,10 @@ uint32_t up_dshot_tc_count(void)
 void up_dshot_tc_reset(void)
 {
 	tc_count = 0;
+
+	if (dma_allocated) {
+		dma_clear_transfer_status(dma_res.base, dma_res.channel);
+	}
 }
 
 void up_dshot_deinit(void)

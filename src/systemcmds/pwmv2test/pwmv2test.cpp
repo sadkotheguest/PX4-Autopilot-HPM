@@ -294,8 +294,9 @@ extern "C" void up_dshot_trigger(void);
 extern "C" uint32_t up_dshot_tc_count(void);
 extern "C" void up_dshot_tc_reset(void);
 extern "C" void up_dshot_deinit(void);
+extern "C" void up_dshot_set_buffer_region(int region);
 
-static int dshot_run(uint32_t clock, unsigned rate_kbit, unsigned throttle_percent, unsigned frames)
+static int dshot_run(uint32_t clock, unsigned rate_kbit, unsigned throttle_percent, unsigned frames, bool region_nc)
 {
 	(void)clock;
 
@@ -310,6 +311,8 @@ static int dshot_run(uint32_t clock, unsigned rate_kbit, unsigned throttle_perce
 	}
 
 	const unsigned rate_hz = rate_kbit * 1000u;
+
+	up_dshot_set_buffer_region(region_nc ? 1 : 0);
 
 	if (up_dshot_init(0x3, rate_hz, false) != OK) {
 		PX4_ERR("up_dshot_init failed");
@@ -536,6 +539,7 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 	bool dshot = false;
 	bool dshotbuf = false;
 	bool dmadiag = false;
+	bool dshot_region_nc = false;
 	const char *dmadiag_dest = "ram";
 	unsigned dshot_rate = 600;
 	unsigned dshot_throttle = 0;
@@ -582,6 +586,10 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 			dshot_frames = strtoul(argv[4], nullptr, 0);
 		}
 
+		if (argc > 5 && strcmp(argv[5], "nc") == 0) {
+			dshot_region_nc = true;
+		}
+
 	} else if (argc > 1 && strcmp(argv[1], "loop") == 0) {
 		loop = true;
 
@@ -623,7 +631,7 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 	}
 
 	if (dshot) {
-		return dshot_run(clock, dshot_rate, dshot_throttle, dshot_frames);
+		return dshot_run(clock, dshot_rate, dshot_throttle, dshot_frames, dshot_region_nc);
 	}
 
 	if (loop) {
