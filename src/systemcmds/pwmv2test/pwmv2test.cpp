@@ -1481,6 +1481,108 @@ static int rxslow_run(void)
 
 	return (changes > 10u && highs > 10u) ? 0 : 1;
 }
+/* ------------------------------------------------------------------------ */
+/* GPTMR capture via TRGM: PE08 sends, PE09 -> TRGM_P_09 -> GPTMR0_IN3.      */
+/* One 2-word DMA per edge (CAPPOS/CAPNEG), no per-edge interrupt.           */
+/* ------------------------------------------------------------------------ */
+
+extern "C" int up_dshot_rxg_init(uint32_t channel_mask);
+extern "C" void up_dshot_rxg_start(void);
+extern "C" void up_dshot_rxg_stop(void);
+extern "C" bool up_dshot_rxg_ready(void);
+extern "C" const uint32_t *up_dshot_rxg_buffer(unsigned channel);
+extern "C" unsigned up_dshot_rxg_words(void);
+extern "C" void up_dshot_rxg_deinit(void);
+
+static int gcap_run(unsigned rate_kbit, unsigned throttle_percent)
+{
+	if (rate_kbit != 150 && rate_kbit != 300 && rate_kbit != 600) {
+		PX4_ERR("usage: pwmv2test gcap [150|300|600] [throttle_pct]");
+		return 1;
+	}
+
+	up_dshot_rxg_deinit();
+	up_dshot_deinit();
+
+	if (up_dshot_init(0x1, rate_kbit * 1000u, false) != OK) {
+		PX4_ERR("gcap: dshot init failed");
+		return 1;
+	}
+
+	/* Capture only the second channel (PE09 -> GPTMR0 channel 3). */
+	if (up_dshot_rxg_init(0x2) != OK) {
+		PX4_ERR("gcap: capture init failed");
+		return 1;
+	}
+
+	uint32_t throttle = 48u + throttle_percent * 2000u / 100u;
+
+	if (throttle > 2047u) {
+		throttle = 2047u;
+	}
+
+	dshot_motor_data_set(0, (uint16_t)throttle, false);
+	up_dshot_arm(true);
+	up_dshot_tc_reset();
+	up_dshot_rxg_start();
+	up_dshot_trigger();
+
+	uint32_t spin = 0;
+
+	while (spin++ < 4000000u && !up_dshot_rxg_ready()) {
+	}
+
+	const bool ready = up_dshot_rxg_ready();
+	up_dshot_rxg_stop();
+	up_dshot_arm(false);
+
+	const uint16_t packet = (uint16_t)((throttle << 1) & 0xFFFFu);
+	const uint16_t crc = (packet ^ (packet >> 4) ^ (packet >> 8)) & 0x0F;
+	const uint16_t sent = (uint16_t)((packet << 4) | crc);
+
+	const uint32_t *buf = up_dshot_rxg_buffer(1u);
+	const unsigned words = up_dshot_rxg_words();
+	const uint32_t gclk = clock_get_frequency(clock_gptmr0);
+	const uint32_t bit_ticks = gclk / (rate_kbit * 1000u);
+
+	uint16_t frame = 0;
+	unsigned bits = 0, edges = 0, last_width = 0;
+
+	if (buf) {
+		for (unsigned i = 0; i < words; i++) {
+			const uint32_t width = buf[i];
+
+			if (width == 0u) {
+				continue;
+			}
+
+			edges++;
+			last_width = width;
+
+			if (bits < 16u) {
+				frame = (uint16_t)((frame << 1) | ((width > (bit_ticks / 2u)) ? 1u : 0u));
+				bits++;
+			}
+
+			if (bits >= 16u) {
+				break;
+			}
+		}
+	}
+	PX4_INFO("gcap: %u kbit/s (bit %u ticks, gptmr %u Hz), throttle %u, frame 0x%04x",
+		 rate_kbit, (unsigned)bit_ticks, (unsigned)gclk, (unsigned)throttle, (unsigned)sent);
+	PX4_INFO("gcap: ready %d, edges %u, %u bits 0x%04x, last width %u -> %s",
+		 ready ? 1 : 0, edges, bits, (unsigned)frame, (unsigned)last_width,
+		 (bits == 16u && frame == sent) ? "MATCH" : "MISMATCH");
+
+	if (buf) {
+		for (unsigned i = 0; i < 8u && i + 1u < words; i += 2u) {
+			PX4_INFO("gcap: [%u] width %u", i, (unsigned)buf[i]);
+		}
+	}
+
+	return (bits == 16u && frame == sent) ? 0 : 1;
+}
 extern "C" int pwmv2test_main(int argc, char *argv[])
 {
 	uint32_t frequency = 1000;
@@ -1495,6 +1597,21 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 	unsigned dshot_rate = 600;
 	unsigned dshot_throttle = 0;
 	unsigned dshot_frames = 3000;   /* duration, ms */
+
+	if (argc > 1 && strcmp(argv[1], "gcap") == 0) {
+		unsigned rate = 600;
+		unsigned thr = 50;
+
+		if (argc > 2) {
+			rate = strtoul(argv[2], nullptr, 0);
+		}
+
+		if (argc > 3) {
+			thr = strtoul(argv[3], nullptr, 0);
+		}
+
+		return gcap_run(rate, thr);
+	}
 
 	if (argc > 1 && strcmp(argv[1], "rxslow") == 0) {
 		return rxslow_run();

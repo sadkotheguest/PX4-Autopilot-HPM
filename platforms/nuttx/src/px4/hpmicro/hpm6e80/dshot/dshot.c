@@ -73,6 +73,7 @@
 #include "hpm_dma_mgr.h"
 #include "hpm_dmamux_src.h"
 #include "hpm_dmav2_drv.h"
+#include "hpm_gptmr_drv.h"
 #include "hpm_ioc_regs.h"
 #include "hpm_iomux.h"
 #include "hpm_pwmv2_drv.h"
@@ -668,6 +669,227 @@ bool up_dshot_capture_get(uint32_t index, uint32_t *value, uint8_t *channel, boo
 }
 
 /* ---------------------------------------------------------------------- */
+/* ---------------------------------------------------------------------- */
+/* BDShot receive via GPTMR capture + DMA, motor pads routed through TRGM  */
+/* ---------------------------------------------------------------------- */
+/*
+ * GPTMR channels 2 and 3 take their capture input from TRGM (outputs
+ * GPTMRn_IN2/IN3), so any pad can be used: pad -> TRGM_P_xx -> GPTMRn_IN2/IN3
+ * -> both-edge capture -> DMA moves CAPPOS/CAPNEG into RAM on every edge.
+ * This costs one 2-word DMA transfer per edge instead of oversampling the
+ * whole GPIO port.
+ */
+
+#define DSHOT_RXG_CHANNELS  2u
+#define DSHOT_RXG_EVENTS    32u            /* captured pulse widths per window */
+#define DSHOT_RXG_WORDS     (DSHOT_RXG_EVENTS)
+
+typedef struct {
+	GPTMR_Type *gptmr;
+	unsigned channel;
+	uint8_t trgm_output;
+	uint8_t dmamux_src;
+} dshot_rxg_map_t;
+
+static const dshot_rxg_map_t rxg_map[DSHOT_RXG_CHANNELS] = {
+	{ HPM_GPTMR0, 2u, HPM_TRGM0_OUTPUT_SRC_GPTMR0_IN2, HPM_DMA_SRC_GPTMR0_2 },
+	{ HPM_GPTMR0, 3u, HPM_TRGM0_OUTPUT_SRC_GPTMR0_IN3, HPM_DMA_SRC_GPTMR0_3 },
+};
+
+static uint32_t rxg_buf[DSHOT_RXG_CHANNELS][DSHOT_RXG_WORDS]
+	__attribute__((section(".ahb_sram")));
+
+static dma_resource_t rxg_res[DSHOT_RXG_CHANNELS];
+static dma_mgr_chn_conf_t rxg_conf[DSHOT_RXG_CHANNELS];
+static volatile uint32_t rxg_tc[DSHOT_RXG_CHANNELS];
+static bool rxg_allocated[DSHOT_RXG_CHANNELS];
+static uint32_t rxg_mask;
+static unsigned rxg_count;
+
+static int dshot_rxg_tc_cb(DMA_Type *base, uint32_t channel, void *cb_data)
+{
+	(void)base;
+	(void)channel;
+
+	const unsigned idx = (unsigned)(uintptr_t)cb_data;
+
+	if (idx < DSHOT_RXG_CHANNELS) {
+		gptmr_stop_counter(rxg_map[idx].gptmr, rxg_map[idx].channel);
+		rxg_tc[idx]++;
+	}
+
+	return 0;
+}
+
+static void dshot_rxg_pad(uint32_t pad_index, unsigned ch)
+{
+	uint32_t func = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(17);   /* TRGM_P_xx */
+
+	HPM_IOC->PAD[pad_index].FUNC_CTL = func;
+	HPM_IOC->PAD[pad_index].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
+}
+
+int up_dshot_rxg_init(uint32_t channel_mask)
+{
+	rxg_mask = channel_mask ? (channel_mask & ((1u << DSHOT_RXG_CHANNELS) - 1u)) : 1u;
+
+	rxg_count = DSHOT_RXG_CHANNELS;
+
+	clock_add_to_group(clock_gptmr0, 0);
+
+	for (unsigned idx = 0; idx < rxg_count; idx++) {
+		if ((rxg_mask & (1u << idx)) == 0) {
+			continue;
+		}
+
+		const dshot_rxg_map_t *m = &rxg_map[idx];
+		const unsigned pin = 8u + idx;   /* PE08, PE09 */
+
+		/* pad -> TRGM.P[pin] */
+		HPM_IOC->PAD[IOC_PAD_PE08 + idx].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(17);
+		HPM_IOC->PAD[IOC_PAD_PE08 + idx].PAD_CTL =
+			IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
+
+		trgm_filter_t filter = {};
+		filter.mode = trgm_filter_mode_bypass;
+		filter.filter_length = 0;
+		trgm_filter_config(HPM_TRGM0, pin, &filter);
+
+		/* TRGM.P[pin] -> GPTMRn_IN2/IN3 */
+		trgm_output_t out = {};
+		out.input = HPM_TRGM0_INPUT_SRC_TRGM0_P00 + pin;
+		out.type = trgm_output_same_as_input;
+		out.invert = false;
+		trgm_output_config(HPM_TRGM0, m->trgm_output, &out);
+
+		gptmr_channel_config_t cfg;
+		gptmr_channel_get_default_config(m->gptmr, &cfg);
+		cfg.mode = gptmr_work_mode_measure_width;
+		cfg.dma_request_event = gptmr_dma_request_on_input_signal_toggle;
+
+		if (gptmr_channel_config(m->gptmr, m->channel, &cfg, false) != status_success) {
+			return -EIO;
+		}
+
+		dma_mgr_init();
+
+		if (dma_mgr_request_resource(&rxg_res[idx]) != status_success) {
+			return -ENODEV;
+		}
+
+		rxg_allocated[idx] = true;
+
+		dma_mgr_get_default_chn_config(&rxg_conf[idx]);
+		rxg_conf[idx].en_dmamux = true;
+		rxg_conf[idx].dmamux_src = m->dmamux_src;
+		rxg_conf[idx].src_mode = 1;
+		rxg_conf[idx].dst_mode = 0;
+		rxg_conf[idx].src_width = DMA_TRANSFER_WIDTH_WORD;
+		rxg_conf[idx].dst_width = DMA_TRANSFER_WIDTH_WORD;
+		rxg_conf[idx].src_addr_ctrl = 2;   /* fixed capture register */
+		rxg_conf[idx].dst_addr_ctrl = 0;
+		rxg_conf[idx].src_burst_size = DMA_NUM_TRANSFER_PER_BURST_1T;
+		rxg_conf[idx].src_addr = (uint32_t)&m->gptmr->CHANNEL[m->channel].CAPDTY;
+		rxg_conf[idx].dst_addr = (uint32_t)rxg_buf[idx];
+		rxg_conf[idx].size_in_byte = DSHOT_RXG_WORDS * sizeof(uint32_t);
+		rxg_conf[idx].en_infiniteloop = false;
+		rxg_conf[idx].handshake_opt = DMA_HANDSHAKE_OPT_ONE_BURST;
+		rxg_conf[idx].interrupt_mask = DMA_INTERRUPT_MASK_ALL & ~DMA_INTERRUPT_MASK_TERMINAL_COUNT;
+
+		if (dma_mgr_setup_channel(&rxg_res[idx], &rxg_conf[idx]) != status_success) {
+			return -EIO;
+		}
+
+		if (dma_mgr_install_chn_tc_callback(&rxg_res[idx], dshot_rxg_tc_cb,
+						    (void *)(uintptr_t)idx) != status_success) {
+			return -EIO;
+		}
+
+		/* The capture event is the DMA request; enable it in the timer. */
+		gptmr_channel_enable_dma_request(m->gptmr, m->channel,
+						 gptmr_dma_request_on_input_signal_toggle);
+	}
+
+	return OK;
+}
+
+void up_dshot_rxg_start(void)
+{
+	for (unsigned idx = 0; idx < rxg_count; idx++) {
+		if ((rxg_mask & (1u << idx)) == 0) {
+			continue;
+		}
+
+		const dshot_rxg_map_t *m = &rxg_map[idx];
+
+		rxg_tc[idx] = 0;
+		memset(rxg_buf[idx], 0, sizeof(rxg_buf[idx]));
+		dma_clear_transfer_status(rxg_res[idx].base, rxg_res[idx].channel);
+
+		if (dma_mgr_setup_channel(&rxg_res[idx], &rxg_conf[idx]) != status_success) {
+			continue;
+		}
+
+		if (dma_mgr_enable_channel(&rxg_res[idx]) != status_success) {
+			continue;
+		}
+
+		gptmr_channel_reset_count(m->gptmr, m->channel);
+		gptmr_start_counter(m->gptmr, m->channel);
+	}
+}
+
+void up_dshot_rxg_stop(void)
+{
+	for (unsigned idx = 0; idx < rxg_count; idx++) {
+		if ((rxg_mask & (1u << idx)) == 0) {
+			continue;
+		}
+
+		gptmr_stop_counter(rxg_map[idx].gptmr, rxg_map[idx].channel);
+		dma_mgr_disable_channel(&rxg_res[idx]);
+	}
+}
+
+bool up_dshot_rxg_ready(void)
+{
+	for (unsigned idx = 0; idx < rxg_count; idx++) {
+		if ((rxg_mask & (1u << idx)) == 0) {
+			continue;
+		}
+
+		if (rxg_tc[idx] == 0u) {
+			return false;
+		}
+	}
+
+	return rxg_mask != 0;
+}
+
+const uint32_t *up_dshot_rxg_buffer(unsigned channel)
+{
+	return (channel < rxg_count) ? rxg_buf[channel] : NULL;
+}
+
+unsigned up_dshot_rxg_words(void)
+{
+	return DSHOT_RXG_WORDS;
+}
+
+void up_dshot_rxg_deinit(void)
+{
+	for (unsigned idx = 0; idx < rxg_count; idx++) {
+		if (!rxg_allocated[idx]) {
+			continue;
+		}
+
+		dma_mgr_disable_channel(&rxg_res[idx]);
+		dma_mgr_release_resource(&rxg_res[idx]);
+		rxg_allocated[idx] = false;
+	}
+
+	rxg_count = 0;
+}
 /* BDShot receive: DMA samples the whole GPIO port into RAM                */
 /* ---------------------------------------------------------------------- */
 /*
