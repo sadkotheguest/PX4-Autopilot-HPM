@@ -547,7 +547,7 @@ static int dmadiag_run(uint32_t clock, unsigned freq_hz, unsigned words, const c
 /* Capture self-test: PE08 sends a DShot frame, PE09 (jumper) captures it.   */
 /* ------------------------------------------------------------------------ */
 
-static int captest_run(unsigned rate_kbit, unsigned throttle_percent)
+static int captest_run(unsigned rate_kbit, unsigned throttle_percent, int cap_sel)
 {
 	if (rate_kbit != 150 && rate_kbit != 300 && rate_kbit != 600) {
 		PX4_ERR("usage: pwmv2test captest [150|300|600] [throttle_pct]");
@@ -561,11 +561,13 @@ static int captest_run(unsigned rate_kbit, unsigned throttle_percent)
 		return 1;
 	}
 
-	/* PE09 as GPIO input with pull-down, capture from the pad. */
-	HPM_IOC->PAD[IOC_PAD_PE09].FUNC_CTL = 0;
+	/* PE09 must stay on its PWM input function: the capture input comes from
+	 * the PWMv2 port P[n], not from the GPIO input path.
+	 */
+	HPM_IOC->PAD[IOC_PAD_PE09].FUNC_CTL = IOC_PE09_FUNC_CTL_PWM1_P_1;
 	HPM_IOC->PAD[IOC_PAD_PE09].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
 
-	pwmv2_capture_selection_input_source(PWM_BASE, pwm_channel_1, pwm_capture_from_gpio);
+	pwmv2_capture_selection_input_source(PWM_BASE, pwm_channel_1, (pwm_capture_input_select_t)(cap_sel ? 1 : 0));
 	pwmv2_set_capture_counter_index(PWM_BASE, pwm_channel_1, 0);
 
 	pwmv2_cmp_config_t cfg = {};
@@ -592,7 +594,7 @@ static int captest_run(unsigned rate_kbit, unsigned throttle_percent)
 	unsigned npos = 0, nneg = 0;
 
 	for (unsigned i = 0; i < 400000u && npos < 20u && nneg < 20u; i++) {
-		const uint32_t sp = pwmv2_get_capture_posedge_irq_status(PWM_BASE);
+		const uint32_t sp = pwmv2_get_capture_posedge_irq_status(PWM_BASE) & (1u << 1);
 
 		if (sp) {
 			const uint32_t v1 = pwmv2_get_capture_posedge_value(PWM_BASE, pwm_channel_1);
@@ -605,7 +607,7 @@ static int captest_run(unsigned rate_kbit, unsigned throttle_percent)
 			}
 		}
 
-		const uint32_t sn = pwmv2_get_capture_negedge_irq_status(PWM_BASE);
+		const uint32_t sn = pwmv2_get_capture_negedge_irq_status(PWM_BASE) & (1u << 1);
 
 		if (sn) {
 			const uint32_t v1 = pwmv2_get_capture_negedge_value(PWM_BASE, pwm_channel_1);
@@ -625,16 +627,44 @@ static int captest_run(unsigned rate_kbit, unsigned throttle_percent)
 		 rate_kbit, (unsigned)throttle, npos, nneg);
 
 	const unsigned pairs = npos < nneg ? npos : nneg;
-	uint16_t bits = 0;
+	const uint32_t reload = clock_get_frequency(clock_pwm1) / (rate_kbit * 1000u) - 1;
+	const uint32_t threshold = reload / 2u;
+
+	const uint16_t packet = (uint16_t)((throttle << 1) & 0xFFFFu);
+	const uint16_t crc = (packet ^ (packet >> 4) ^ (packet >> 8)) & 0x0F;
+	const uint16_t sent = (uint16_t)((packet << 4) | crc);
+
+	uint16_t received = 0;
 	unsigned decoded = 0;
 
 	for (unsigned i = 0; i < pairs && decoded < 16u; i++) {
-		/* The counter counts down from the period. */
-		const uint32_t high = pos[i] > neg[i] ? pos[i] - neg[i] : 0;
-		PX4_INFO("captest: %u pos %u neg %u high %u", i, (unsigned)pos[i], (unsigned)neg[i], (unsigned)high);
+		/* Counter counts down: the high time is the distance pos -> neg. */
+		const uint32_t high = (pos[i] - neg[i]) & 0xFFFFFFu;
+		const bool bit = high > threshold;
+
+		received = (uint16_t)((received << 1) | (bit ? 1u : 0u));
+		decoded++;
+
+		PX4_INFO("captest: %u pos %u neg %u high %u bit %d", i, (unsigned)pos[i],
+			 (unsigned)neg[i], (unsigned)high, bit ? 1 : 0);
 	}
 
-	PX4_INFO("captest: frame sent 0x%04x", (unsigned)((throttle << 1) & 0xFFFFu));
+	if (decoded == 16u) {
+		PX4_INFO("captest: sent 0x%04x received 0x%04x %s", (unsigned)sent, (unsigned)received,
+			 sent == received ? "MATCH" : "MISMATCH");
+
+	} else {
+		PX4_INFO("captest: only %u bits decoded, sent 0x%04x", decoded, (unsigned)sent);
+	}
+
+	PX4_INFO("captest: frame sent 0x%04x, sel %d", (unsigned)((throttle << 1) & 0xFFFFu), cap_sel);
+	PX4_INFO("captest raw: POS0 0x%08x POS1 0x%08x POS2 0x%08x",
+		 (unsigned)PWM_BASE->CAPTURE_POS[0], (unsigned)PWM_BASE->CAPTURE_POS[1],
+		 (unsigned)PWM_BASE->CAPTURE_POS[2]);
+	PX4_INFO("captest raw: NEG0 0x%08x NEG1 0x%08x", (unsigned)PWM_BASE->CAPTURE_NEG[0], (unsigned)PWM_BASE->CAPTURE_NEG[1]);
+	PX4_INFO("captest raw: STS_POS 0x%08x STS_NEG 0x%08x CNT0 %u CNT1 %u",
+		 (unsigned)PWM_BASE->IRQ_STS_CAP_POS, (unsigned)PWM_BASE->IRQ_STS_CAP_NEG,
+		 (unsigned)PWM_BASE->CNT_VAL[0], (unsigned)PWM_BASE->CNT_VAL[1]);
 
 	up_dshot_deinit();
 
@@ -667,7 +697,13 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 			thr = strtoul(argv[3], nullptr, 0);
 		}
 
-		return captest_run(rate, thr);
+		int sel = 0;
+
+		if (argc > 4 && strcmp(argv[4], "trgm") == 0) {
+			sel = 1;
+		}
+
+		return captest_run(rate, thr, sel);
 	}
 
 	if (argc > 1 && strcmp(argv[1], "dmadiag") == 0) {

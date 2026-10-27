@@ -147,3 +147,45 @@ Next experiments:
 4. Only after the snapshot works: replace polling by the capture DMA request
    (`pwmv2_enable_dma_at_compare_point`) and decode the DShot frame from the
    captured edges (compare with `channel_frame[0]`), then add GCR decoding.
+## Capture bring-up: resolved facts (UM HPM6E00UMENV08, ch. 42.4.12, 42.6.17)
+
+- Input capture is a **dedicated module per PWM channel** (not the comparator):
+  on a rising edge the counter value is latched into `CAPTURE_POS[n]`, on a
+  falling edge into `CAPTURE_NEG[n]` (bits 31:8 = 24-bit counter value,
+  bits 1:0 = `CNT_INDEX`, bit 4 = `CAPTURE_SELGPIO`).
+- `CAPTURE_SELGPIO = 0` selects the PWMv2 port `P[n]` (the pad), `1` selects
+  the TRGM input.  Note: the SDK enum has the opposite naming
+  (`pwm_capture_from_gpio = 1`), so pass 0 for the pad.
+- The captured signal comes from the PWM port, therefore the pad **must stay
+  on its PWM alternate function** (`PWM1_P_x`).  Configuring the pad as plain
+  GPIO disconnects the capture input (observed: `CAPTURE_POS[1]` stayed
+  `0xFFFFFF00`, the "no capture" value).
+- A channel can capture its own output: with the pad in `PWM1_P_0` mode,
+  `CAPTURE_POS[0] = 0x0000f300` (counter value 0xF3 = 243) was latched from
+  the DShot output on PE08 without any external wiring - useful for a
+  self-test.
+- `IRQ_STS_CAP_POS/NEG` are W1C bitmaps (bit n = channel n); `IRQ_EN_CAP_POS/NEG`
+  enable the interrupt.
+
+### Important correction for the receive path
+
+UM 42.4.16 "DMA Requests": PWMv2 generates DMA requests **only** for compare
+value match events or counter reload events.  The input capture module has no
+DMA request, so a "capture DMA" as in the STM32 port is **not available**.
+BDShot receive must therefore be **interrupt driven**: one ISR per captured
+edge that stores the counter value into a ring buffer.
+
+Edge budget: a DShot frame has ~32 edges, a GCR reply ~21; at 1 kHz frames and
+telemetry requested every N frames this is a few thousand interrupts per
+second - acceptable.  Revisit if the frame rate is raised.
+
+### Current self-test state
+
+`pwmv2test captest <rate> <throttle>` sends one frame on PE08 and captures it
+on PE09 (jumper) or on PE08/PE08 (pad self-capture).  Verified so far:
+`CAPTURE_POS[0]` latches real counter values; channel 1 with the pad in
+`PWM1_P_1` mode latches values as well.  Polling for the events is racy (the
+registers only hold the last edge, and several edges may arrive between two
+polls), so the decode shows only the last pair.  Next step: replace the
+polling loop with the capture interrupt and a ring buffer, then decode the
+16 bits of the transmitted frame and compare them with `channel_frame[0]`.
