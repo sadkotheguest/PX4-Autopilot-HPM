@@ -1864,10 +1864,19 @@ static int gcapd_run(unsigned rate_kbit, unsigned throttle_percent, bool chain)
 	const uint16_t sent = (uint16_t)((packet << 4) | crc);
 
 	dshot_motor_data_set(0, (uint16_t)throttle, false);
+
+	/* 1. drive the pad first and let it settle, so enabling the output cannot
+	 *    inject an edge into the receive window
+	 */
 	up_dshot_arm(true);
+	usleep(50);
+
+	/* 2. arm and start the receive DMA chain, then wait before sending */
 	up_dshot_tc_reset();
 	up_dshot_rxp_start();
 	usleep(50);
+
+	/* 3. start the transmission */
 	up_dshot_trigger();
 
 	uint32_t spin = 0;

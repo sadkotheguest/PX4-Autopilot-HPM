@@ -430,8 +430,6 @@ void up_dshot_trigger(void)
 	 */
 	pwmv2_shadow_register_lock(pwm);
 
-	pwmv2_shadow_register_lock(pwm);
-
 	/* Re-arm the descriptor chain from its first node. */
 	dma_clear_transfer_status(dma_res.base, dma_res.channel);
 
@@ -1469,8 +1467,12 @@ void up_dshot_rxp_start(void)
 		return;
 	}
 
-	gptmr_clear_status(HPM_GPTMR0, GPTMR_CH_CAP_STAT_MASK(DSHOT_RXP_CHANNEL));
+	/* Reset the counter first and only then drop the capture flag: resetting
+	 * the counter can itself produce a capture event that would otherwise
+	 * consume the first DMA node of the window.
+	 */
 	gptmr_channel_reset_count(HPM_GPTMR0, DSHOT_RXP_CHANNEL);
+	gptmr_clear_status(HPM_GPTMR0, GPTMR_CH_CAP_STAT_MASK(DSHOT_RXP_CHANNEL));
 	memset(rxp_buf, 0, sizeof(rxp_buf));
 
 	rxp_tc = 0;
