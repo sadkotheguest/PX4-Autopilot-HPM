@@ -727,6 +727,16 @@ static dma_mgr_chn_conf_t rxg_conf[DSHOT_RXG_CHANNELS];
 static volatile uint32_t rxg_tc[DSHOT_RXG_CHANNELS];
 static bool rxg_allocated[DSHOT_RXG_CHANNELS];
 static uint32_t rxg_mask;
+static unsigned rxg_filter_len = 8u;
+static unsigned rxg_prio;
+static bool rxg_read_period;
+
+void up_dshot_rxcfg(unsigned filter_len, unsigned prio, bool read_period)
+{
+	rxg_filter_len = filter_len;
+	rxg_prio = prio;
+	rxg_read_period = read_period;
+}
 static unsigned rxg_count;
 
 static int dshot_rxg_tc_cb(DMA_Type *base, uint32_t channel, void *cb_data)
@@ -815,7 +825,10 @@ int up_dshot_rxg_init(uint32_t channel_mask)
 		rxg_conf[idx].src_addr_ctrl = 2;   /* fixed capture register */
 		rxg_conf[idx].dst_addr_ctrl = 0;
 		rxg_conf[idx].src_burst_size = DMA_NUM_TRANSFER_PER_BURST_1T;
-		rxg_conf[idx].src_addr = (uint32_t)&m->gptmr->CHANNEL[m->channel].CAPDTY;
+		rxg_conf[idx].src_addr = (uint32_t)(rxg_read_period
+						  ? &m->gptmr->CHANNEL[m->channel].CAPPRD
+						  : &m->gptmr->CHANNEL[m->channel].CAPDTY);
+		rxg_conf[idx].priority = (uint8_t)rxg_prio;
 		rxg_conf[idx].dst_addr = (uint32_t)rxg_buf[idx];
 		rxg_conf[idx].size_in_byte = DSHOT_RXG_WORDS * sizeof(uint32_t);
 		rxg_conf[idx].en_infiniteloop = false;
