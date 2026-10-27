@@ -1318,6 +1318,188 @@ bool up_dshot_rxi_get(uint32_t index, uint32_t *value, uint8_t *channel, bool *p
 
 	return true;
 }
+/* ---------------------------------------------------------------------- */
+/* GPTMR capture + DMA chain, paired buffer (CAPPOS, CAPNEG) per event     */
+/* ---------------------------------------------------------------------- */
+/*
+ * One capture channel in both-edge mode; the DMA chain has one descriptor
+ * per capture event.  Each node reads CAPPOS and CAPNEG with a single 2-word
+ * burst (source increments inside the burst, base is restored by the next
+ * node) and writes the pair into the buffer.  The decoder then knows exactly
+ * which register changed and when, without any interrupt per edge.
+ */
+
+#define DSHOT_RXP_EVENTS    32u
+#define DSHOT_RXP_WORDS     (DSHOT_RXP_EVENTS * 2u)
+#define DSHOT_RXP_CHANNEL   3u          /* GPTMR0 channel 3 */
+#define DSHOT_RXP_TRGM_OUT  HPM_TRGM0_OUTPUT_SRC_GPTMR0_IN3
+
+static uint32_t rxp_buf[DSHOT_RXP_WORDS] __attribute__((section(".ahb_sram")));
+static dma_mgr_linked_descriptor_t rxp_desc[DSHOT_RXP_EVENTS]
+	__attribute__((section(".ahb_sram"))) __attribute__((aligned(8)));
+
+static dma_resource_t rxp_res;
+static dma_mgr_chn_conf_t rxp_conf;
+static bool rxp_allocated;
+static volatile uint32_t rxp_tc;
+
+static int dshot_rxp_tc_cb(DMA_Type *base, uint32_t channel, void *cb_data)
+{
+	(void)base;
+	(void)channel;
+	(void)cb_data;
+
+	gptmr_stop_counter(HPM_GPTMR0, DSHOT_RXP_CHANNEL);
+	rxp_tc++;
+
+	return 0;
+}
+
+int up_dshot_rxp_init(bool chain)
+{
+	const unsigned pin = 9u;   /* PE09 */
+
+	clock_add_to_group(clock_gptmr0, 0);
+	clock_add_to_group(clock_hdma, 0);
+
+	HPM_IOC->PAD[IOC_PAD_PE09].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(17);
+	HPM_IOC->PAD[IOC_PAD_PE09].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
+
+	trgm_filter_t filter = {};
+	filter.mode = trgm_filter_mode_rapid_change;
+	filter.filter_length = 8;
+	trgm_filter_config(HPM_TRGM0, pin, &filter);
+
+	trgm_output_t out = {};
+	out.input = HPM_TRGM0_INPUT_SRC_TRGM0_P00 + pin;
+	out.type = trgm_output_same_as_input;
+	out.invert = false;
+	trgm_output_config(HPM_TRGM0, DSHOT_RXP_TRGM_OUT, &out);
+
+	gptmr_channel_config_t cfg;
+	gptmr_channel_get_default_config(HPM_GPTMR0, &cfg);
+	cfg.mode = gptmr_work_mode_capture_at_both_edge;
+	cfg.dma_request_event = gptmr_dma_request_on_input_signal_toggle;
+
+	if (gptmr_channel_config(HPM_GPTMR0, DSHOT_RXP_CHANNEL, &cfg, false) != status_success) {
+		return -EIO;
+	}
+
+	dma_mgr_init();
+
+	if (dma_mgr_request_resource(&rxp_res) != status_success) {
+		return -ENODEV;
+	}
+
+	rxp_allocated = true;
+
+	dma_mgr_get_default_chn_config(&rxp_conf);
+	rxp_conf.en_dmamux = true;
+	rxp_conf.dmamux_src = HPM_DMA_SRC_GPTMR0_3;
+	rxp_conf.src_mode = 1;                    /* peripheral request */
+	rxp_conf.dst_mode = 0;
+	rxp_conf.src_width = DMA_TRANSFER_WIDTH_WORD;
+	rxp_conf.dst_width = DMA_TRANSFER_WIDTH_WORD;
+	rxp_conf.src_addr_ctrl = 0;               /* increment inside the burst */
+	rxp_conf.dst_addr_ctrl = 0;
+	rxp_conf.src_burst_size = DMA_NUM_TRANSFER_PER_BURST_2T;
+	rxp_conf.src_addr = (uint32_t)&HPM_GPTMR0->CHANNEL[DSHOT_RXP_CHANNEL].CAPPOS;
+	rxp_conf.dst_addr = (uint32_t)&rxp_buf[0];
+	rxp_conf.size_in_byte = 2u * sizeof(uint32_t);
+	rxp_conf.en_infiniteloop = false;
+	rxp_conf.handshake_opt = DMA_HANDSHAKE_OPT_ONE_BURST;
+
+	/* One descriptor per capture event: pair (CAPPOS, CAPNEG) into the buffer. */
+	for (unsigned k = 0; chain && k < DSHOT_RXP_EVENTS; k++) {
+		dma_mgr_chn_conf_t node = rxp_conf;
+
+		node.dst_addr = (uint32_t)&rxp_buf[k * 2u];
+		node.linked_ptr = (k + 1u < DSHOT_RXP_EVENTS) ? (uint32_t)&rxp_desc[k + 1u] : 0;
+		node.interrupt_mask = (k + 1u == DSHOT_RXP_EVENTS)
+				      ? (DMA_INTERRUPT_MASK_ALL & ~DMA_INTERRUPT_MASK_TERMINAL_COUNT)
+				      : DMA_INTERRUPT_MASK_ALL;
+
+		if (dma_mgr_config_linked_descriptor(&rxp_res, &node, &rxp_desc[k]) != status_success) {
+			return -EIO;
+		}
+	}
+
+	rxp_conf.linked_ptr = chain ? (uint32_t)&rxp_desc[0] : 0;
+
+	if (dma_mgr_setup_channel(&rxp_res, &rxp_conf) != status_success) {
+		return -EIO;
+	}
+
+	if (dma_mgr_install_chn_tc_callback(&rxp_res, dshot_rxp_tc_cb, NULL) != status_success) {
+		return -EIO;
+	}
+
+	/* Capture event is the DMA request. */
+	gptmr_channel_enable_dma_request(HPM_GPTMR0, DSHOT_RXP_CHANNEL, true);
+
+	return OK;
+}
+
+void up_dshot_rxp_start(void)
+{
+	if (!rxp_allocated) {
+		return;
+	}
+
+	gptmr_clear_status(HPM_GPTMR0, GPTMR_CH_CAP_STAT_MASK(DSHOT_RXP_CHANNEL));
+	gptmr_channel_reset_count(HPM_GPTMR0, DSHOT_RXP_CHANNEL);
+	memset(rxp_buf, 0, sizeof(rxp_buf));
+
+	rxp_tc = 0;
+	dma_clear_transfer_status(rxp_res.base, rxp_res.channel);
+
+	if (dma_mgr_setup_channel(&rxp_res, &rxp_conf) != status_success) {
+		return;
+	}
+
+	if (dma_mgr_enable_channel(&rxp_res) != status_success) {
+		return;
+	}
+
+	gptmr_start_counter(HPM_GPTMR0, DSHOT_RXP_CHANNEL);
+}
+
+void up_dshot_rxp_stop(void)
+{
+	if (!rxp_allocated) {
+		return;
+	}
+
+	gptmr_stop_counter(HPM_GPTMR0, DSHOT_RXP_CHANNEL);
+	dma_mgr_disable_channel(&rxp_res);
+}
+
+bool up_dshot_rxp_ready(void)
+{
+	return rxp_tc != 0u;
+}
+
+const uint32_t *up_dshot_rxp_buffer(void)
+{
+	return rxp_buf;
+}
+
+unsigned up_dshot_rxp_words(void)
+{
+	return DSHOT_RXP_WORDS;
+}
+
+void up_dshot_rxp_deinit(void)
+{
+	if (!rxp_allocated) {
+		return;
+	}
+
+	gptmr_stop_counter(HPM_GPTMR0, DSHOT_RXP_CHANNEL);
+	dma_mgr_disable_channel(&rxp_res);
+	dma_mgr_release_resource(&rxp_res);
+	rxp_allocated = false;
+}
 /* Bidirectional DShot is not implemented yet; keep the API consistent. */
 int up_bdshot_num_erpm_ready(void) { return 0; }
 int up_bdshot_get_erpm(uint8_t channel, int *erpm) { (void)channel; if (erpm) { *erpm = 0; } return -ENOSYS; }

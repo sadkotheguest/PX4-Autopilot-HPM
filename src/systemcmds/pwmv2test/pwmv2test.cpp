@@ -1821,6 +1821,155 @@ static int gcapisr_run(unsigned rate_kbit, unsigned throttle_percent)
 
 	return (bits == 16u && frame == sent) ? 0 : 1;
 }
+/* ------------------------------------------------------------------------ */
+/* Paired-buffer DMA chain receiver: each event writes (CAPPOS, CAPNEG).     */
+/* ------------------------------------------------------------------------ */
+
+extern "C" int up_dshot_rxp_init(bool chain);
+extern "C" void up_dshot_rxp_start(void);
+extern "C" void up_dshot_rxp_stop(void);
+extern "C" bool up_dshot_rxp_ready(void);
+extern "C" const uint32_t *up_dshot_rxp_buffer(void);
+extern "C" unsigned up_dshot_rxp_words(void);
+extern "C" void up_dshot_rxp_deinit(void);
+
+static int gcapd_run(unsigned rate_kbit, unsigned throttle_percent, bool chain)
+{
+	if (rate_kbit != 150 && rate_kbit != 300 && rate_kbit != 600) {
+		PX4_ERR("usage: pwmv2test gcapd [150|300|600] [throttle_pct]");
+		return 1;
+	}
+
+	up_dshot_rxp_deinit();
+	up_dshot_deinit();
+
+	if (up_dshot_init(0x1, rate_kbit * 1000u, false) != OK) {
+		PX4_ERR("gcapd: dshot init failed");
+		return 1;
+	}
+
+	if (up_dshot_rxp_init(chain) != OK) {
+		PX4_ERR("gcapd: capture init failed");
+		return 1;
+	}
+
+	uint32_t throttle = 48u + throttle_percent * 2000u / 100u;
+
+	if (throttle > 2047u) {
+		throttle = 2047u;
+	}
+
+	const uint16_t packet = (uint16_t)((throttle << 1) & 0xFFFFu);
+	const uint16_t crc = (packet ^ (packet >> 4) ^ (packet >> 8)) & 0x0F;
+	const uint16_t sent = (uint16_t)((packet << 4) | crc);
+
+	dshot_motor_data_set(0, (uint16_t)throttle, false);
+	up_dshot_arm(true);
+	up_dshot_tc_reset();
+	up_dshot_rxp_start();
+	usleep(50);
+	up_dshot_trigger();
+
+	uint32_t spin = 0;
+
+	while (spin++ < 2000000u && !up_dshot_rxp_ready()) {
+	}
+
+	up_dshot_rxp_stop();
+	up_dshot_arm(false);
+
+	const uint32_t gclk = clock_get_frequency(clock_gptmr0);
+	const uint32_t bit_ticks = gclk / (rate_kbit * 1000u);
+	const uint32_t *buf = up_dshot_rxp_buffer();
+	const unsigned words = up_dshot_rxp_words();
+
+	uint32_t last_pos = 0xFFFFFFFFu, last_neg = 0xFFFFFFFFu;
+	uint32_t rise = 0;
+	bool have_rise = false;
+	uint16_t frame = 0;
+	unsigned bits = 0, edges = 0, pairs = 0;
+
+	for (unsigned i = 0; i + 1u < words; i += 2u) {
+		const uint32_t pos = buf[i];
+		const uint32_t neg = buf[i + 1u];
+
+		if (pos == 0u && neg == 0u) {
+			break;
+		}
+
+		pairs++;
+
+		const bool new_pos = (pos != last_pos);
+		const bool new_neg = (neg != last_neg);
+		last_pos = pos;
+		last_neg = neg;
+
+		/* Handle up to two edges per pair, in timestamp order. */
+		for (unsigned e = 0; e < 2u; e++) {
+			bool posedge;
+
+			if (new_pos && new_neg) {
+				posedge = (e == 0u) ? (pos < neg) : (pos >= neg);
+
+			} else if (new_pos) {
+				if (e > 0u) {
+					break;
+				}
+
+				posedge = true;
+
+			} else if (new_neg) {
+				if (e > 0u) {
+					break;
+				}
+
+				posedge = false;
+
+			} else {
+				break;
+			}
+
+			const uint32_t value = posedge ? pos : neg;
+
+			if (posedge) {
+				rise = value;
+				have_rise = true;
+				edges++;
+
+			} else if (have_rise) {
+				const uint32_t width = (value - rise) & 0xFFFFFFu;
+				have_rise = false;
+				edges++;
+
+				if (width == 0u || width > (bit_ticks + (bit_ticks / 2u))) {
+					continue;
+				}
+
+				if (bits < 16u) {
+					frame = (uint16_t)((frame << 1) | ((width > (bit_ticks / 2u)) ? 1u : 0u));
+					bits++;
+				}
+			}
+		}
+
+		if (bits >= 16u) {
+			break;
+		}
+	}
+
+	PX4_INFO("gcapd: %s, %u kbit/s (bit %u ticks), thr %u, sent 0x%04x recv 0x%04x (%u bits, %u edges, %u pairs) -> %s",
+		 chain ? "chain" : "single",
+		 rate_kbit, (unsigned)bit_ticks, (unsigned)throttle, (unsigned)sent, (unsigned)frame,
+		 bits, edges, pairs, (bits == 16u && frame == sent) ? "MATCH" : "MISMATCH");
+
+	if (buf) {
+		for (unsigned i = 0; i + 1u < words && i < 12u; i += 2u) {
+			PX4_INFO("gcapd: [%u] pos %u neg %u", i / 2u, (unsigned)buf[i], (unsigned)buf[i + 1u]);
+		}
+	}
+
+	return (bits == 16u && frame == sent) ? 0 : 1;
+}
 extern "C" int pwmv2test_main(int argc, char *argv[])
 {
 	uint32_t frequency = 1000;
@@ -1835,6 +1984,23 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 	unsigned dshot_rate = 600;
 	unsigned dshot_throttle = 0;
 	unsigned dshot_frames = 3000;   /* duration, ms */
+
+	if (argc > 1 && strcmp(argv[1], "gcapd") == 0) {
+		unsigned rate = 600;
+		unsigned thr = 50;
+
+		if (argc > 2) {
+			rate = strtoul(argv[2], nullptr, 0);
+		}
+
+		if (argc > 3) {
+			thr = strtoul(argv[3], nullptr, 0);
+		}
+
+		const bool chain = !(argc > 4 && strcmp(argv[4], "single") == 0);
+
+		return gcapd_run(rate, thr, chain);
+	}
 
 	if (argc > 1 && strcmp(argv[1], "gcapisr") == 0) {
 		unsigned rate = 600;
