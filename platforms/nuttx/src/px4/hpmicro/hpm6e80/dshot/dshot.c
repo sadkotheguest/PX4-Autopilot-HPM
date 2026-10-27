@@ -536,7 +536,7 @@ static int dshot_capture_isr(int irq, void *context, void *arg)
 	return 0;
 }
 
-int up_dshot_capture_init(uint32_t channel_mask)
+int up_dshot_capture_init_source(uint32_t channel_mask, unsigned selgpio)
 {
 	cap_channels = (uint8_t)channel_mask;
 
@@ -545,8 +545,8 @@ int up_dshot_capture_init(uint32_t channel_mask)
 			continue;
 		}
 
-		/* Capture input comes from the PWM port P[n] (SELGPIO = 0). */
-		pwmv2_capture_selection_input_source(pwm, (pwm_channel_t)ch, (pwm_capture_input_select_t)0);
+		/* SELGPIO = 0: PWMv2 port P[n]; 1: TRGM.P (pads routed through TRGM). */
+		pwmv2_capture_selection_input_source(pwm, (pwm_channel_t)ch, (pwm_capture_input_select_t)selgpio);
 		pwmv2_set_capture_counter_index(pwm, (pwm_channel_t)ch, (uint8_t)counter);
 	}
 
@@ -565,6 +565,11 @@ int up_dshot_capture_init(uint32_t channel_mask)
 	up_enable_irq(HPM_IRQn_PWM1);
 
 	return OK;
+}
+
+int up_dshot_capture_init(uint32_t channel_mask)
+{
+	return up_dshot_capture_init_source(channel_mask, 0);
 }
 
 void up_dshot_capture_set_counter(unsigned index)

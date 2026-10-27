@@ -333,3 +333,40 @@ Next steps for the receive path:
 3. Re-verify the decoded bits against a scope trace before trusting the decoder:
    the widths seen at 150 kbit all equal 37.5 % of the bit time, which hints at
    an ordering/selection problem rather than at the transmitter.
+### PWMv2 capture: the documented path goes through TRGM
+
+UM facts (ch. 42.4.12, 42.4.16, 22.3.3, 55.2.4, pin mux):
+
+- A capture channel can take its input from the PWMv2 port `P[n]`
+  (`CAPTURE_SELGPIO = 0`) or from "other IOs", i.e. TRGM (`= 1`).
+- TRGM.P[15:8] are wired to PWM1 capture inputs [7:0], TRGM.P[23:16] to PWM2,
+  TRGM.P[7:0] to PWM0, TRGM.P[31:24] to PWM3.
+- The pads of all four motor outputs can be routed into TRGM:
+  PE08 -> `TRGM_P_08`, PE09 -> `TRGM_P_09`, PE10 -> `TRGM_P_10`,
+  PE11 -> `TRGM_P_11` (pin mux alt 17).  This is the only documented way to
+  capture the ESC reply on a motor pad, because the pad cannot stay in the PWM
+  output function and be an input at the same time.
+- The TRGM input filter sits in front of the capture: `trgm_filter_config()`
+  with `trgm_filter_mode_bypass` (or `rapid_change` with a short length) must be
+  used, otherwise the filter delay distorts the edge timing.
+- `pwmv2test trgmcap` implements exactly this: PE09 -> TRGM.P[9] -> PWM1
+  capture[1], filter bypass, capture IRQ, DShot frame sent on PE08.
+
+Result: the captured values now depend on the bit rate (600 kbit: pos 90 / neg 7
+with reload 332; 150 kbit: pos 840 / neg 7 with reload 1332), i.e. the TRGM path
+is alive - but the per-edge value still does not refresh (identical pairs), so
+the status/clear or the per-channel update still needs work.
+
+Important constraints for the BDShot design:
+
+- PWMv2 generates DMA requests only on compare-match and reload events
+  (UM 42.4.16); **input capture has no DMA request**, so a capture value can
+  only be moved by the CPU (interrupt or polling).
+- GPTMR, in contrast, can select the capture event as its DMA request
+  (`gptmr_dma_request_on_input_signal_toggle`), i.e. DMA-driven edge capture is
+  possible - but GPTMR0 only exposes CAPT_0/CAPT_1 and only on a few pads
+  (PA06/PC06/PE06/PV06 and PA09/PC09/PE09/PV09), so it cannot serve all four
+  motor pads without rewiring.
+- Interrupt load is not a problem in practice: PX4 requests telemetry from one
+  ESC at a time (round-robin), so the capture IRQ is only enabled for that
+  motor's reply window (~21 edges per telemetry frame), not continuously.

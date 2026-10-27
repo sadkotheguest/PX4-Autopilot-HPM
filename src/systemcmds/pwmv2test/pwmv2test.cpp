@@ -984,6 +984,91 @@ static int gptmrcap_run(unsigned rate_kbit, unsigned throttle_percent)
 
 	return (bits == 16u && received == sent) ? 0 : 1;
 }
+/* ------------------------------------------------------------------------ */
+/* PWM capture through TRGM: PE08 sends, PE09 -> TRGM_P_09 -> PWM1 cap[1].   */
+/* ------------------------------------------------------------------------ */
+
+extern "C" int up_dshot_capture_init_source(uint32_t channel_mask, unsigned selgpio);
+
+static int trgmcap_run(unsigned rate_kbit, unsigned throttle_percent)
+{
+	if (rate_kbit != 150 && rate_kbit != 300 && rate_kbit != 600) {
+		PX4_ERR("usage: pwmv2test trgmcap [150|300|600] [throttle_pct]");
+		return 1;
+	}
+
+	up_dshot_deinit();
+	up_dshot_set_buffer_region(0);
+
+	if (up_dshot_init(0x1, rate_kbit * 1000u, false) != OK) {
+		PX4_ERR("trgmcap: dshot init failed");
+		return 1;
+	}
+
+	/* PE09 routed into TRGM.P[9] and through the TRGM filter (bypass). */
+	HPM_IOC->PAD[IOC_PAD_PE09].FUNC_CTL = IOC_PE09_FUNC_CTL_TRGM_P_09;
+	HPM_IOC->PAD[IOC_PAD_PE09].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
+
+	trgm_filter_t filter = {};
+	filter.mode = trgm_filter_mode_bypass;
+	filter.filter_length = 0;
+	trgm_filter_config(HPM_TRGM0, 9u, &filter);
+
+	if (up_dshot_capture_init_source(0x2, 1u) != OK) {
+		PX4_ERR("trgmcap: capture init failed");
+		return 1;
+	}
+
+	up_dshot_capture_enable(true);
+
+	uint32_t throttle = 48u + throttle_percent * 2000u / 100u;
+
+	if (throttle > 2047u) {
+		throttle = 2047u;
+	}
+
+	dshot_motor_data_set(0, (uint16_t)throttle, false);
+	up_dshot_arm(true);
+	up_dshot_tc_reset();
+	up_dshot_capture_reset();
+	up_dshot_trigger();
+
+	uint32_t spin = 0;
+
+	while (spin++ < 2000000u && up_dshot_tc_count() == 0) {
+	}
+
+	usleep(100);
+	up_dshot_capture_enable(false);
+	up_dshot_arm(false);
+
+	const uint16_t packet = (uint16_t)((throttle << 1) & 0xFFFFu);
+	const uint16_t crc = (packet ^ (packet >> 4) ^ (packet >> 8)) & 0x0F;
+	const uint16_t sent = (uint16_t)((packet << 4) | crc);
+	const uint32_t reload = clock_get_frequency(clock_pwm1) / (rate_kbit * 1000u) - 1;
+
+	unsigned bits_down = 0, pairs_down = 0, bits_up = 0, pairs_up = 0;
+	const uint16_t frame_down = cap_decode(reload, false, &bits_down, &pairs_down);
+	const uint16_t frame_up = cap_decode(reload, true, &bits_up, &pairs_up);
+	const bool ok = ((bits_down == 16u) && (frame_down == sent)) || ((bits_up == 16u) && (frame_up == sent));
+
+	PX4_INFO("trgmcap: %u kbit/s, throttle %u, frame 0x%04x, edges %u",
+		 rate_kbit, (unsigned)throttle, (unsigned)sent, (unsigned)up_dshot_capture_count());
+	PX4_INFO("trgmcap: down %u bits 0x%04x, up %u bits 0x%04x -> %s",
+		 bits_down, (unsigned)frame_down, bits_up, (unsigned)frame_up,
+		 ok ? "MATCH" : "MISMATCH");
+
+	for (uint32_t i = 0; i < up_dshot_capture_count() && i < 8u; i++) {
+		uint32_t value = 0;
+		uint8_t channel = 0;
+		bool posedge = false;
+		up_dshot_capture_get(i, &value, &channel, &posedge);
+		PX4_INFO("trgmcap: [%u] ch %u %s %u", (unsigned)i, (unsigned)channel,
+			 posedge ? "pos" : "neg", (unsigned)value);
+	}
+
+	return ok ? 0 : 1;
+}
 extern "C" int pwmv2test_main(int argc, char *argv[])
 {
 	uint32_t frequency = 1000;
@@ -998,6 +1083,21 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 	unsigned dshot_rate = 600;
 	unsigned dshot_throttle = 0;
 	unsigned dshot_frames = 3000;   /* duration, ms */
+
+	if (argc > 1 && strcmp(argv[1], "trgmcap") == 0) {
+		unsigned rate = 600;
+		unsigned thr = 50;
+
+		if (argc > 2) {
+			rate = strtoul(argv[2], nullptr, 0);
+		}
+
+		if (argc > 3) {
+			thr = strtoul(argv[3], nullptr, 0);
+		}
+
+		return trgmcap_run(rate, thr);
+	}
 
 	if (argc > 1 && strcmp(argv[1], "gptmrcap") == 0) {
 		unsigned rate = 600;
