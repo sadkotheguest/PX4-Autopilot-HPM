@@ -825,6 +825,13 @@ void up_dshot_rxg_start(void)
 
 		const dshot_rxg_map_t *m = &rxg_map[idx];
 
+		/* Start the window from a known capture state: drop any pending CAPF
+		 * and restart the channel counter, otherwise the first DMA entry is a
+		 * leftover measurement from the previous window.
+		 */
+		gptmr_clear_status(m->gptmr, GPTMR_CH_CAP_STAT_MASK(m->channel));
+		gptmr_channel_reset_count(m->gptmr, m->channel);
+
 		rxg_tc[idx] = 0;
 		memset(rxg_buf[idx], 0, sizeof(rxg_buf[idx]));
 		dma_clear_transfer_status(rxg_res[idx].base, rxg_res[idx].channel);
@@ -837,7 +844,6 @@ void up_dshot_rxg_start(void)
 			continue;
 		}
 
-		gptmr_channel_reset_count(m->gptmr, m->channel);
 		gptmr_start_counter(m->gptmr, m->channel);
 	}
 }
