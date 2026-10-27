@@ -41,18 +41,29 @@ later without re-doing the investigation.
 - Buffers/descriptors live in non-cacheable memory (`.ahb_sram` or
   `.noncacheable.bss`); both were validated for the TX path.
 
-## Direction switching
+## Direction switching (resolved: no pad mux change)
 
-The wire must be released before the ESC answers.  Two options:
+The pad must STAY on the PWM alternate function - that is what feeds the
+capture input (`CAPTURE_POS/NEG[n]` come from the PWMv2 port `P[n]`).
+Switching the pad to a plain GPIO function kills the capture input (measured:
+`CAPTURE_POS[1]` stayed at the invalid `0xFFFFFF00`).
 
-1. **Pad function switch (preferred, cheap):** for the capture window set
-   `HPM_IOC->PAD[PE0x].FUNC_CTL` to GPIO input (and enable the GPIO input
-   path), then switch back to `PWM1_P_x` for the next frame.  This is two
-   register writes per frame, comparable to what the STM32 port does.
-2. **Open-drain / released output:** keep the PWM function and configure the
-   pad open-drain, relying on the ESC to pull the line.  Needs checking
-   whether PWMv2 releases the pad when the channel output is disabled; if it
-   does not, contention remains.
+The wire is released with the PWM channel output instead:
+
+- `pwmv2_channel_disable_output(pwm, ch)` clears `CFG1.HIGHZ_EN_N`, which puts
+  the pad into high-Z (the bit is literally the "high-Z enable" control);
+- `pwmv2_channel_enable_output(pwm, ch)` restores the push-pull output.
+
+Both are plain work-register read-modify-writes (no shadow/lock event needed),
+so they apply immediately.  Cost per frame: one RMW per channel for release
+and one for re-enable (4 channels -> 8 accesses), plus the counter enable
+(`CNT_GLBCFG`).  An AHB read+write pair to PWM registers costs on the order
+of 50-100 ns, i.e. well below 1 us per frame boundary, against a 33 us frame
+at 600 kbit/s or a 1 ms frame period at 1 kHz.  Negligible.
+
+If a defined level is needed while the line floats (between our last bit and
+the ESC answer), enable the pad pull-down once in `PAD_CTL` at init - it is a
+one-time write, not a per-frame operation.
 
 ### Considered alternative: sample the GPIO IDR with a second DMA
 
