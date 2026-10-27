@@ -2188,6 +2188,82 @@ static int pwmregs_run(unsigned rate_kbit)
 	up_dshot_arm(false);
 	return 0;
 }
+/* ------------------------------------------------------------------------ */
+/* Measure-mode receiver: GPTMR computes the width itself, one DMA channel.  */
+/* ------------------------------------------------------------------------ */
+
+static int gcapm_run(unsigned rate_kbit, unsigned throttle_percent)
+{
+	if (rate_kbit < 20 || rate_kbit > 1200) {
+		PX4_ERR("usage: pwmv2test gcapm <rate_kbit> [throttle_pct]");
+		return 1;
+	}
+
+	up_dshot_rxg_deinit();
+	up_dshot_deinit();
+
+	if (up_dshot_init(0x1, rate_kbit * 1000u, false) != OK) {
+		PX4_ERR("gcapm: dshot init failed");
+		return 1;
+	}
+
+	if (up_dshot_rxg_init(0x2) != OK) {
+		PX4_ERR("gcapm: capture init failed");
+		return 1;
+	}
+
+	uint32_t throttle = 48u + throttle_percent * 2000u / 100u;
+
+	if (throttle > 2047u) {
+		throttle = 2047u;
+	}
+
+	const uint16_t packet = (uint16_t)((throttle << 1) & 0xFFFFu);
+	const uint16_t crc = (packet ^ (packet >> 4) ^ (packet >> 8)) & 0x0F;
+	const uint16_t sent = (uint16_t)((packet << 4) | crc);
+
+	dshot_motor_data_set(0, (uint16_t)throttle, false);
+	up_dshot_arm(true);
+	usleep(50);
+	up_dshot_tc_reset();
+	up_dshot_rxg_start();
+	usleep(50);
+	up_dshot_trigger();
+
+	uint32_t spin = 0;
+
+	while (spin++ < 2000000u && up_dshot_tc_count() == 0) {
+	}
+
+	usleep(200);
+	up_dshot_rxg_stop();
+	up_dshot_arm(false);
+
+	const uint32_t gclk = clock_get_frequency(clock_gptmr0);
+	const uint32_t bit_ticks = gclk / (rate_kbit * 1000u);
+	const uint32_t *buf = up_dshot_rxg_buffer(1u);
+	const unsigned words = up_dshot_rxg_words();
+
+	PX4_INFO("gcapm: %u kbit/s (bit %u ticks), thr %u, sent 0x%04x",
+		 rate_kbit, (unsigned)bit_ticks, (unsigned)throttle, (unsigned)sent);
+
+	unsigned shown = 0;
+
+	for (unsigned i = 0; i < words; i++) {
+		if (buf[i] != 0u) {
+			PX4_INFO("gcapm: w[%2u] %u", i, (unsigned)buf[i]);
+			shown++;
+
+			if (shown >= 20u) {
+				break;
+			}
+		}
+	}
+
+	PX4_INFO("gcapm: non-zero entries %u", shown);
+
+	return 0;
+}
 extern "C" int pwmv2test_main(int argc, char *argv[])
 {
 	uint32_t frequency = 1000;
@@ -2202,6 +2278,21 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 	unsigned dshot_rate = 600;
 	unsigned dshot_throttle = 0;
 	unsigned dshot_frames = 3000;   /* duration, ms */
+
+	if (argc > 1 && strcmp(argv[1], "gcapm") == 0) {
+		unsigned rate = 600;
+		unsigned thr = 50;
+
+		if (argc > 2) {
+			rate = strtoul(argv[2], nullptr, 0);
+		}
+
+		if (argc > 3) {
+			thr = strtoul(argv[3], nullptr, 0);
+		}
+
+		return gcapm_run(rate, thr);
+	}
 
 	if (argc > 1 && strcmp(argv[1], "pwmregs") == 0) {
 		return pwmregs_run(argc > 2 ? strtoul(argv[2], nullptr, 0) : 150u);

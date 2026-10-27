@@ -702,7 +702,7 @@ bool up_dshot_capture_get(uint32_t index, uint32_t *value, uint8_t *channel, boo
  */
 
 #define DSHOT_RXG_CHANNELS  2u
-#define DSHOT_RXG_EVENTS    32u            /* captured pulse widths per window */
+#define DSHOT_RXG_EVENTS    48u            /* captured pulse widths per window */
 #define DSHOT_RXG_WORDS     (DSHOT_RXG_EVENTS)
 
 typedef struct {
