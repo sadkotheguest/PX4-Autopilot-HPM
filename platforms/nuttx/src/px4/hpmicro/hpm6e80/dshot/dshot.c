@@ -300,8 +300,7 @@ int up_dshot_init(uint32_t channel_mask_in, unsigned dshot_pwm_freq, bool enable
 	}
 
 	/* The DMA burst is one word per channel; keep it a power of two. */
-	num_channels = (channel_mask & 0x3) == 0x3 ? 2 :
-		       (channel_mask & 0xC) ? 4 :
+	num_channels = (channel_mask & 0x8) ? 4 :
 		       (channel_mask & 0x2) ? 2 : 1;
 
 	dshot_pins();

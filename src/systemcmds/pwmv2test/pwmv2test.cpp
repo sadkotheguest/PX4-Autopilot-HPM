@@ -316,7 +316,7 @@ static int dshot_run(uint32_t clock, unsigned rate_kbit, unsigned throttle_perce
 
 	up_dshot_set_buffer_region(region_nc ? 1 : 0);
 
-	if (up_dshot_init(0x3, rate_hz, false) != OK) {
+	if (up_dshot_init(0xF, rate_hz, false) != OK) {
 		PX4_ERR("up_dshot_init failed");
 		return 1;
 	}
@@ -327,11 +327,16 @@ static int dshot_run(uint32_t clock, unsigned rate_kbit, unsigned throttle_perce
 		throttle = 2047u;
 	}
 
-	/* Two channels with different throttles to verify independence. */
-	dshot_motor_data_set(0, (uint16_t)throttle, false);
+	/* Different throttle per channel to verify independence. */
+	const uint16_t thr[4] = {
+		(uint16_t)throttle,
+		(uint16_t)(2047u - throttle),
+		(uint16_t)(throttle / 2u),
+		(uint16_t)(2047u - throttle / 2u)
+	};
 
-	if (up_dshot_num_channels() > 1) {
-		dshot_motor_data_set(1, (uint16_t)(2047u - throttle), false);
+	for (unsigned ch = 0; ch < up_dshot_num_channels(); ch++) {
+		dshot_motor_data_set(ch, thr[ch], false);
 	}
 
 	if (up_dshot_arm(true) != OK) {
@@ -376,10 +381,9 @@ static int dshot_run(uint32_t clock, unsigned rate_kbit, unsigned throttle_perce
 	up_dshot_arm(false);
 	up_dshot_deinit();
 
-	PX4_INFO("dshot %u kbit/s, %u ch, ch0 %u / ch1 %u, %u words, frames %u/%u",
-		 rate_kbit, up_dshot_num_channels(), (unsigned)throttle,
-		 up_dshot_num_channels() > 1 ? (unsigned)(2047u - throttle) : 0u,
-		 up_dshot_frame_words(), complete, sent);
+	PX4_INFO("dshot %u kbit/s, %u ch, thr %u/%u/%u/%u, %u words, frames %u/%u",
+		 rate_kbit, up_dshot_num_channels(), (unsigned)thr[0], (unsigned)thr[1],
+		 (unsigned)thr[2], (unsigned)thr[3], up_dshot_frame_words(), complete, sent);
 	PX4_INFO("trigger time: min %u us, avg %u us, max %u us (bit period %u us)",
 		 (unsigned)t_min, (unsigned)(t_sum / (sent ? sent : 1)), (unsigned)t_max,
 		 (unsigned)(1000000u / rate_hz));
