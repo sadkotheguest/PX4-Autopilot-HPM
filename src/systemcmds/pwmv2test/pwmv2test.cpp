@@ -129,9 +129,23 @@ static void pwm_apply(uint32_t clock, uint32_t frequency, unsigned duty_percent)
 
 /* ------------------------------------------------------------------------ */
 /* DShot bring-up: PWMv2 generates the bit stream, DMA feeds the duty shadow */
+/*                                                                          */
+/* Output: PE08 / PE09 = PWM1 channels 0 / 1 (motor header).  Both channels   */
+/* share one duty shadow and the period of counter 0, so they output the same */
+/* frame.                                                                    */
 /* ------------------------------------------------------------------------ */
 
 static constexpr uint8_t DSHOT_GAP_BITS = 60;
+
+static constexpr pwm_counter_t DSHOT_COUNTER = pwm_counter_0;
+static constexpr uint8_t DSHOT_CMP_DUTY0 = 0;   /* channel 0: duty */
+static constexpr uint8_t DSHOT_CMP_EDGE0 = 1;   /* channel 0: period edge */
+static constexpr uint8_t DSHOT_CMP_DUTY1 = 2;   /* channel 1: duty */
+static constexpr uint8_t DSHOT_CMP_EDGE1 = 3;   /* channel 1: period edge */
+static constexpr uint8_t DSHOT_PERIOD_SHADOW = PWMV2_SHADOW_INDEX(0);
+static constexpr uint8_t DSHOT_DUTY_SHADOW = PWMV2_SHADOW_INDEX(1);
+static constexpr uint8_t DSHOT_EDGE_SHADOW = PWMV2_SHADOW_INDEX(2);
+
 static uint32_t dshot_buf[16 + DSHOT_GAP_BITS];
 
 /* Comparator 0 counts down from the period: 75 % for a "1", 37.5 % for a "0". */
@@ -157,6 +171,14 @@ static uint16_t dshot_frame_bits(unsigned throttle_percent)
 	return (uint16_t)((value << 4) | crc);
 }
 
+static void dshot_pins(void)
+{
+	HPM_IOC->PAD[IOC_PAD_PE08].FUNC_CTL = IOC_PE08_FUNC_CTL_PWM1_P_0;
+	HPM_IOC->PAD[IOC_PAD_PE08].PAD_CTL = IOC_PAD_PAD_CTL_DS_SET(7) | IOC_PAD_PAD_CTL_SPD_SET(2);
+	HPM_IOC->PAD[IOC_PAD_PE09].FUNC_CTL = IOC_PE09_FUNC_CTL_PWM1_P_1;
+	HPM_IOC->PAD[IOC_PAD_PE09].PAD_CTL = IOC_PAD_PAD_CTL_DS_SET(7) | IOC_PAD_PAD_CTL_SPD_SET(2);
+}
+
 static int dshot_run(uint32_t clock, unsigned rate_kbit, unsigned throttle_percent, unsigned frames)
 {
 	if (rate_kbit != 150 && rate_kbit != 300 && rate_kbit != 600) {
@@ -169,6 +191,8 @@ static int dshot_run(uint32_t clock, unsigned rate_kbit, unsigned throttle_perce
 		return 1;
 	}
 
+	dshot_pins();
+
 	/* Bit period in counter ticks. */
 	const uint32_t bit_ns = 1000000000u / (rate_kbit * 1000u);
 	const uint32_t reload = (uint32_t)((uint64_t)clock * bit_ns / 1000000000ULL) - 1;
@@ -176,11 +200,8 @@ static int dshot_run(uint32_t clock, unsigned rate_kbit, unsigned throttle_perce
 
 	/* A value written by DMA at the end of period N is latched at reload N+1,
 	 * so bit 0 is preloaded and the buffer starts with bit 1.  The trailing
-	 * zero-duty entries provide the inter-frame gap.
-	 */
-	/* The DMA writes the value for the *next* period, so the buffer starts
-	 * with bit 1; bit 0 is preloaded and also appended at the end so that the
-	 * cyclic buffer keeps every frame aligned.
+	 * zero-duty entries provide the inter-frame gap; bit 0 is appended again
+	 * so that the cyclic buffer keeps every frame aligned.
 	 */
 	for (int i = 1; i < 16; i++) {
 		dshot_buf[i - 1] = dshot_cmp(reload, (frame >> (15 - i)) & 1) << 8;
@@ -192,30 +213,34 @@ static int dshot_run(uint32_t clock, unsigned rate_kbit, unsigned throttle_perce
 
 	dshot_buf[15 + DSHOT_GAP_BITS] = dshot_cmp(reload, (frame >> 15) & 1) << 8;
 
+
 	pwmv2_deinit(PWM_BASE);
 	pwmv2_shadow_register_unlock(PWM_BASE);
 
-	pwmv2_set_shadow_val(PWM_BASE, PWM_PERIOD_SHADOW, reload, 0, false);
-	pwmv2_set_shadow_val(PWM_BASE, PWM_DUTY_SHADOW, dshot_cmp(reload, (frame >> 15) & 1), 0, false);
-	pwmv2_set_shadow_val(PWM_BASE, PWM_PERIOD_CMP_SHADOW, reload + 1, 0, false);
+	pwmv2_set_shadow_val(PWM_BASE, DSHOT_PERIOD_SHADOW, reload, 0, false);
+	pwmv2_set_shadow_val(PWM_BASE, DSHOT_DUTY_SHADOW, dshot_cmp(reload, (frame >> 15) & 1), 0, false);
+	pwmv2_set_shadow_val(PWM_BASE, DSHOT_EDGE_SHADOW, reload + 1, 0, false);
 
-	pwmv2_counter_select_data_offset_from_shadow_value(PWM_BASE, PWM_COUNTER, PWM_PERIOD_SHADOW);
-	pwmv2_counter_burst_disable(PWM_BASE, PWM_COUNTER);
-	pwmv2_set_reload_update_time(PWM_BASE, PWM_COUNTER, pwm_reload_update_on_reload);
+	pwmv2_counter_select_data_offset_from_shadow_value(PWM_BASE, DSHOT_COUNTER, DSHOT_PERIOD_SHADOW);
+	pwmv2_counter_burst_disable(PWM_BASE, DSHOT_COUNTER);
+	pwmv2_set_reload_update_time(PWM_BASE, DSHOT_COUNTER, pwm_reload_update_on_reload);
 
-	pwmv2_select_cmp_source(PWM_BASE, PWM_CMP0, cmp_value_from_shadow_val, PWM_DUTY_SHADOW);
-	pwmv2_select_cmp_source(PWM_BASE, PWM_CMP1, cmp_value_from_shadow_val, PWM_PERIOD_CMP_SHADOW);
+	pwmv2_select_cmp_source(PWM_BASE, DSHOT_CMP_DUTY0, cmp_value_from_shadow_val, DSHOT_DUTY_SHADOW);
+	pwmv2_select_cmp_source(PWM_BASE, DSHOT_CMP_EDGE0, cmp_value_from_shadow_val, DSHOT_EDGE_SHADOW);
+	pwmv2_select_cmp_source(PWM_BASE, DSHOT_CMP_DUTY1, cmp_value_from_shadow_val, DSHOT_DUTY_SHADOW);
+	pwmv2_select_cmp_source(PWM_BASE, DSHOT_CMP_EDGE1, cmp_value_from_shadow_val, DSHOT_EDGE_SHADOW);
 
 	pwmv2_shadow_register_lock(PWM_BASE);
 
 	/* One DMA request per period: comparator 1 hits at the period edge. */
-	pwmv2_enable_dma_at_compare_point(PWM_BASE, pwm_dma_0, PWM_CMP1);
+	pwmv2_enable_dma_at_compare_point(PWM_BASE, pwm_dma_0, DSHOT_CMP_EDGE0);
 
-	pwmv2_disable_four_cmp(PWM_BASE, (pwm_channel_t)(PWM_CHANNEL & ~1));
-	pwmv2_channel_enable_output(PWM_BASE, PWM_CHANNEL);
+	pwmv2_disable_four_cmp(PWM_BASE, pwm_channel_0);
+	pwmv2_channel_enable_output(PWM_BASE, pwm_channel_0);
+	pwmv2_channel_enable_output(PWM_BASE, pwm_channel_1);
 
-	pwmv2_enable_counter(PWM_BASE, PWM_COUNTER);
-	pwmv2_start_pwm_output(PWM_BASE, PWM_COUNTER);
+	pwmv2_enable_counter(PWM_BASE, DSHOT_COUNTER);
+	pwmv2_start_pwm_output(PWM_BASE, DSHOT_COUNTER);
 
 	/* Route the PWM DMA request through TRGM to a DMAMUX source for HDMA. */
 	trgm_dma_request_config(HPM_TRGM0, TRGM_DMACFG_0, HPM_TRGM0_DMA_SRC_PWM1_REQ0);
@@ -241,7 +266,7 @@ static int dshot_run(uint32_t clock, unsigned rate_kbit, unsigned throttle_perce
 	conf.dst_addr_ctrl = 2;                 /* fixed */
 	conf.size_in_byte = sizeof(dshot_buf);
 	conf.src_addr = (uint32_t)dshot_buf;
-	conf.dst_addr = (uint32_t)&PWM_BASE->SHADOW_VAL[PWM_DUTY_SHADOW];
+	conf.dst_addr = (uint32_t)&PWM_BASE->SHADOW_VAL[DSHOT_DUTY_SHADOW];
 	conf.interrupt_mask = 0;
 	conf.en_infiniteloop = true;
 
@@ -262,13 +287,14 @@ static int dshot_run(uint32_t clock, unsigned rate_kbit, unsigned throttle_perce
 	/* Write probe: are the DMAMUX registers writable at all? */
 	HPM_DMAMUX->MUXCFG[0] = 0x80000064u;
 	PX4_INFO("mux probe readback=0x%08x", (unsigned)HPM_DMAMUX->MUXCFG[0]);
+
 	/* While the stream runs, sample the duty shadow: DMA must be cycling
 	 * through the "0" and "1" comparator values.
 	 */
 	uint32_t shadow_min = 0xFFFFFFFFu, shadow_max = 0;
 
 	for (unsigned ms = 0; ms < frames; ms++) {
-		const uint32_t shadow = PWM_BASE->SHADOW_VAL[PWM_DUTY_SHADOW] >> 8;
+		const uint32_t shadow = PWM_BASE->SHADOW_VAL[DSHOT_DUTY_SHADOW] >> 8;
 
 		if (shadow < shadow_min) {
 			shadow_min = shadow;
@@ -282,20 +308,20 @@ static int dshot_run(uint32_t clock, unsigned rate_kbit, unsigned throttle_perce
 	}
 
 	dma_mgr_disable_channel(&dma_res);
-	pwmv2_disable_counter(PWM_BASE, PWM_COUNTER);
-	pwmv2_channel_disable_output(PWM_BASE, PWM_CHANNEL);
+	pwmv2_disable_counter(PWM_BASE, DSHOT_COUNTER);
+	pwmv2_channel_disable_output(PWM_BASE, pwm_channel_0);
+	pwmv2_channel_disable_output(PWM_BASE, pwm_channel_1);
 
-	PX4_INFO("dshot %u kbit/s, throttle %u%%, reload %u, frame 0x%04x, %u ms, DMA ch %d",
+	PX4_INFO("dshot PE08/PE09 (PWM1 ch0/1): %u kbit/s, throttle %u%%, reload %u, frame 0x%04x, %u ms, DMA ch %d",
 		 rate_kbit, throttle_percent, (unsigned)reload, (unsigned)frame, frames, (int)dma_res.channel);
 	PX4_INFO("shadow min/max %u/%u (expect %u/%u), cnt %u", (unsigned)shadow_min, (unsigned)shadow_max,
 		 (unsigned)dshot_cmp(reload, false), (unsigned)dshot_cmp(reload, true),
-		 (unsigned)PWM_BASE->CNT_VAL[PWM_COUNTER]);
+		 (unsigned)PWM_BASE->CNT_VAL[DSHOT_COUNTER]);
 	PX4_INFO("buf: %u %u %u ... %u", (unsigned)dshot_buf[0], (unsigned)dshot_buf[1],
 		 (unsigned)dshot_buf[2], (unsigned)dshot_buf[15 + DSHOT_GAP_BITS]);
 
 	return 0;
 }
-
 extern "C" int pwmv2test_main(int argc, char *argv[])
 {
 	uint32_t frequency = 1000;
