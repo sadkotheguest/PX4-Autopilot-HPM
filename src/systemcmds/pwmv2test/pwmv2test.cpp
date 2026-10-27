@@ -1968,14 +1968,12 @@ static int gcapd_run(unsigned rate_kbit, unsigned throttle_percent, bool chain)
 		 rate_kbit, (unsigned)bit_ticks, (unsigned)throttle, (unsigned)sent, (unsigned)frame,
 		 bits, edges, pairs, (bits == 16u && frame == sent) ? "MATCH" : "MISMATCH");
 
+	PX4_INFO("gcapd: ready %d, pairs dumped in full:", up_dshot_rxp_ready() ? 1 : 0);
+
 	if (buf) {
 		unsigned shown = 0;
 
 		for (unsigned i = 0; i + 1u < words; i += 2u, shown++) {
-			if (buf[i] == 0u && buf[i + 1u] == 0u) {
-				break;
-			}
-
 			PX4_INFO("gcapd: [%2u] pos %10u neg %10u", shown,
 				 (unsigned)buf[i], (unsigned)buf[i + 1u]);
 		}

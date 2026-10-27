@@ -232,10 +232,10 @@ static void dshot_pwm_init(void)
 	 * well before the next reload latches it (no race with the latch).
 	 */
 	const uint8_t sh_dma_trig = PWMV2_SHADOW_INDEX(4);
-	pwmv2_set_shadow_val(pwm, sh_dma_trig, reload - 8u, 0, false);
+	pwmv2_set_shadow_val(pwm, sh_dma_trig, reload / 2u, 0, false);
 
 	pwmv2_cmp_config_t cmp_trig = {};
-	cmp_trig.cmp = reload - 8u;
+	cmp_trig.cmp = reload / 2u;
 	cmp_trig.cmp_source = cmp_value_from_shadow_val;
 	cmp_trig.cmp_source_index = sh_dma_trig;
 	cmp_trig.update_trigger = pwm_shadow_register_update_on_reload;
