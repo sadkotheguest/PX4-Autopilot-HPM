@@ -567,6 +567,15 @@ int up_dshot_capture_init(uint32_t channel_mask)
 	return OK;
 }
 
+void up_dshot_capture_set_counter(unsigned index)
+{
+	for (unsigned ch = 0; ch < 8; ch++) {
+		if (cap_channels & (1u << ch)) {
+			pwmv2_set_capture_counter_index(pwm, (pwm_channel_t)ch, (uint8_t)index);
+		}
+	}
+}
+
 void up_dshot_capture_enable(bool enable)
 {
 	if (enable) {

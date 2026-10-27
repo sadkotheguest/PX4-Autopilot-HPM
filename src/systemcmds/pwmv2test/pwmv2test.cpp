@@ -725,6 +725,89 @@ static int capscan_run(void)
 
 	return fail == 0 ? 0 : 1;
 }
+/* ------------------------------------------------------------------------ */
+/* Capture diagnostics: slow 1 kHz PWM on PE09 captured by channel 1 itself  */
+/* (the capture input sees the pad), CNT_INDEX sweep, output on/off.         */
+/* ------------------------------------------------------------------------ */
+
+extern "C" void up_dshot_capture_set_counter(unsigned index);
+
+static int capdiag_run(void)
+{
+	clock_add_to_group(clock_pwm1, 0);
+
+	const uint32_t clock = clock_get_frequency(clock_pwm1);
+	const uint32_t reload = clock / 1000u - 1;
+
+	pwmv2_deinit(PWM_BASE);
+	pwmv2_shadow_register_unlock(PWM_BASE);
+	pwmv2_set_shadow_val(PWM_BASE, PWMV2_SHADOW_INDEX(0), reload, 0, false);
+	pwmv2_set_shadow_val(PWM_BASE, PWMV2_SHADOW_INDEX(1), reload / 2u, 0, false);
+	pwmv2_set_shadow_val(PWM_BASE, PWMV2_SHADOW_INDEX(2), reload + 1u, 0, false);
+	pwmv2_counter_select_data_offset_from_shadow_value(PWM_BASE, pwm_counter_0, PWMV2_SHADOW_INDEX(0));
+	pwmv2_counter_burst_disable(PWM_BASE, pwm_counter_0);
+	pwmv2_set_reload_update_time(PWM_BASE, pwm_counter_0, pwm_reload_update_on_shlk);
+	pwmv2_shadow_register_lock(PWM_BASE);
+	pwmv2_issue_shadow_register_lock_event(PWM_BASE);
+
+	HPM_IOC->PAD[IOC_PAD_PE08].FUNC_CTL = IOC_PE08_FUNC_CTL_PWM1_P_0;
+	HPM_IOC->PAD[IOC_PAD_PE08].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
+	HPM_IOC->PAD[IOC_PAD_PE09].FUNC_CTL = IOC_PE09_FUNC_CTL_PWM1_P_1;
+	HPM_IOC->PAD[IOC_PAD_PE09].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
+
+	PX4_INFO("capdiag: 1 kHz, 50%% duty (reload %u, duty cmp %u)", (unsigned)reload, (unsigned)(reload / 2u));
+
+	for (unsigned ch = 0; ch < 2u; ch++) {
+		pwmv2_select_cmp_source(PWM_BASE, 2 * ch, cmp_value_from_shadow_val, PWMV2_SHADOW_INDEX(1));
+		pwmv2_select_cmp_source(PWM_BASE, 2 * ch + 1, cmp_value_from_shadow_val, PWMV2_SHADOW_INDEX(2));
+		pwmv2_disable_four_cmp(PWM_BASE, (pwm_channel_t)ch);
+		pwmv2_channel_disable_output(PWM_BASE, (pwm_channel_t)ch);
+	}
+
+	for (unsigned ch = 0; ch < 2u; ch++) {
+		if (up_dshot_capture_init(1u << ch) != OK) {
+			PX4_ERR("capdiag: capture init failed");
+			return 1;
+		}
+
+		for (unsigned out = 0; out < 2u; out++) {
+			if (out) {
+				pwmv2_channel_enable_output(PWM_BASE, (pwm_channel_t)ch);
+
+			} else {
+				pwmv2_channel_disable_output(PWM_BASE, (pwm_channel_t)ch);
+			}
+
+			pwmv2_reset_counter(PWM_BASE, pwm_counter_0);
+			pwmv2_enable_counter(PWM_BASE, pwm_counter_0);
+			pwmv2_start_pwm_output(PWM_BASE, pwm_counter_0);
+
+			up_dshot_capture_reset();
+			up_dshot_capture_enable(true);
+			usleep(4000);
+			up_dshot_capture_enable(false);
+			pwmv2_disable_counter(PWM_BASE, pwm_counter_0);
+
+			const uint32_t count = up_dshot_capture_count();
+			const uint32_t raw = PWM_BASE->CAPTURE_POS[ch];
+
+			PX4_INFO("capdiag: ch %u out %u edges %u raw POS 0x%08x", ch, out, (unsigned)count, (unsigned)raw);
+
+			for (uint32_t i = 0; i < count && i < 4u; i++) {
+				uint32_t value = 0;
+				uint8_t channel = 0;
+				bool posedge = false;
+				up_dshot_capture_get(i, &value, &channel, &posedge);
+				PX4_INFO("capdiag:   [%u] ch %u %s %u", (unsigned)i, (unsigned)channel,
+					 posedge ? "pos" : "neg", (unsigned)value);
+			}
+
+			pwmv2_channel_disable_output(PWM_BASE, (pwm_channel_t)ch);
+		}
+	}
+
+	return 0;
+}
 extern "C" int pwmv2test_main(int argc, char *argv[])
 {
 	uint32_t frequency = 1000;
@@ -739,6 +822,10 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 	unsigned dshot_rate = 600;
 	unsigned dshot_throttle = 0;
 	unsigned dshot_frames = 3000;   /* duration, ms */
+
+	if (argc > 1 && strcmp(argv[1], "capdiag") == 0) {
+		return capdiag_run();
+	}
 
 	if (argc > 1 && strcmp(argv[1], "capscan") == 0) {
 		return capscan_run();

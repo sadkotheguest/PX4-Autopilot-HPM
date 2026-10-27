@@ -253,3 +253,43 @@ Hypotheses to test next:
    change with the period (this separates "latch works" from "too fast").
 4. Check whether the capture input for channel 1 needs the channel output
    enabled (the pad is in PWM1_P_1 with the channel output in high-Z).
+### Capture diagnostics, items 1-4 (capdiag)
+
+`pwmv2test capdiag` builds a 1 kHz / 50 % PWM on channel 0 and channel 1 and
+sweeps the capture counter index and the output enable:
+
+    capdiag: 1 kHz, 50% duty (reload 199999, duty cmp 99999)
+    capdiag: ch 0 out 0 edges 0 raw POS 0xffffff00
+    capdiag: ch 0 out 1 edges 0 raw POS 0xffffff00
+    capdiag: ch 1 out 0 edges 0 raw POS 0xffffff00
+    capdiag: ch 1 out 1 edges 0 raw POS 0xffffff00
+
+Findings:
+
+- For the slow 1 kHz signal the capture module reports **no edges at all** and
+  `CAPTURE_POS` stays at the invalid `0xFFFFFF00`, for both channels, with the
+  output enabled or tri-stated, and for every `CNT_INDEX` value.
+- With the DShot frame (600 kbit) the status bits do get set, but the latched
+  values never change (always pos 90 / neg 7), which is consistent with those
+  status bits being caused by the output enable/high-Z transitions rather than
+  by real capture events.
+- Writing the shadow lock event before starting the counter (a genuine bug in
+  the first capdiag version) did not change the result.
+- `CAPTURE_POS/CNT_INDEX` bits read back exactly as written, so the register
+  configuration itself is accepted; the pad input simply does not reach the
+  capture module in this configuration.
+
+### Next experiment: GPTMR input capture instead of PWMv2 capture
+
+The SDK ships `samples/drivers/gptmr/input_capture`, i.e. GPTMR has a known
+working edge-capture path.  For BDShot the plan becomes:
+
+1. Validate GPTMR input capture on this board (pin -> GPTMR capture, IRQ or DMA
+   of the capture register), measure the timestamp resolution.
+2. If it works, use GPTMR for the reply window: one capture channel per motor
+   (or one for the first motor, then extend), timestamps -> edge list ->
+   GCR decode.
+3. Keep the PWMv2 capture code (`up_dshot_capture_*`) as a fallback and revisit
+   it only if the GPTMR path has a drawback (e.g. not enough capture channels).
+
+The DShot transmit path is unaffected: it is verified and stays as is.
