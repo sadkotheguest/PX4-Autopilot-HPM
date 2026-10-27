@@ -1835,8 +1835,8 @@ extern "C" void up_dshot_rxp_deinit(void);
 
 static int gcapd_run(unsigned rate_kbit, unsigned throttle_percent, bool chain)
 {
-	if (rate_kbit != 150 && rate_kbit != 300 && rate_kbit != 600) {
-		PX4_ERR("usage: pwmv2test gcapd [150|300|600] [throttle_pct]");
+	if (rate_kbit < 20 || rate_kbit > 1200) {
+		PX4_ERR("usage: pwmv2test gcapd <rate_kbit> [throttle_pct]");
 		return 1;
 	}
 
@@ -1872,9 +1872,13 @@ static int gcapd_run(unsigned rate_kbit, unsigned throttle_percent, bool chain)
 
 	uint32_t spin = 0;
 
-	while (spin++ < 2000000u && !up_dshot_rxp_ready()) {
+	/* Wait for the end of the transmitted frame, then give the capture DMA a
+	 * moment to store the last event before shutting it down.
+	 */
+	while (spin++ < 2000000u && up_dshot_tc_count() == 0) {
 	}
 
+	usleep(200);
 	up_dshot_rxp_stop();
 	up_dshot_arm(false);
 

@@ -295,7 +295,10 @@ static int dshot_dma_init(void)
 	dma_conf.src_addr = (uint32_t)frame_buf;
 	dma_conf.dst_addr = (uint32_t)&pwm->SHADOW_VAL[DSHOT_BIT_SLOT0];
 	dma_conf.size_in_byte = num_channels * sizeof(uint32_t);
-	dma_conf.linked_ptr = (uint32_t)&dshot_desc[0];
+	/* CHCTRL itself performs the first transfer (word 0), so the chain must
+	 * continue with descriptor 1 - otherwise word 0 is sent twice.
+	 */
+	dma_conf.linked_ptr = (uint32_t)&dshot_desc[1];
 	dma_conf.en_infiniteloop = false;
 	dma_conf.handshake_opt = DMA_HANDSHAKE_OPT_ONE_BURST;
 	dma_conf.interrupt_mask = DMA_INTERRUPT_MASK_ALL & ~DMA_INTERRUPT_MASK_TERMINAL_COUNT;
@@ -1444,7 +1447,7 @@ int up_dshot_rxp_init(bool chain)
 		}
 	}
 
-	rxp_conf.linked_ptr = chain ? (uint32_t)&rxp_desc[0] : 0;
+	rxp_conf.linked_ptr = chain ? (uint32_t)&rxp_desc[1] : 0;
 
 	if (dma_mgr_setup_channel(&rxp_res, &rxp_conf) != status_success) {
 		return -EIO;
