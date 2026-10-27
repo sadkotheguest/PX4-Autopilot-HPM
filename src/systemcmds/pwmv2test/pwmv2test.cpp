@@ -2434,6 +2434,97 @@ static int gcapmseq_run(unsigned rate_kbit)
 
 	return (fail == 0) ? 0 : 1;
 }
+/* ------------------------------------------------------------------------ */
+/* Fully independent TX check: PE09 as GPIO input, CPU polls the level and   */
+/* timestamps edges with a free-running GPTMR counter (no capture, no DMA).  */
+/* ------------------------------------------------------------------------ */
+
+#define POLLSCAN_EDGES 64u
+
+static int pollscan_run(unsigned rate_kbit, unsigned throttle_percent)
+{
+	up_dshot_deinit();
+
+	if (up_dshot_init(0x1, rate_kbit * 1000u, false) != OK) {
+		PX4_ERR("pollscan: dshot init failed");
+		return 1;
+	}
+
+	const uint16_t packet = (uint16_t)(((48u + throttle_percent * 2000u / 100u) << 1) & 0xFFFFu);
+	const uint16_t crc = (packet ^ (packet >> 4) ^ (packet >> 8)) & 0x0F;
+	const uint16_t sent = (uint16_t)((packet << 4) | crc);
+	const uint32_t throttle = 48u + throttle_percent * 2000u / 100u;
+
+	/* Free-running 100 MHz counter for timestamps (plain counter mode). */
+	clock_add_to_group(clock_gptmr1, 0);
+
+	gptmr_channel_config_t cfg;
+	gptmr_channel_get_default_config(HPM_GPTMR1, &cfg);
+	cfg.mode = gptmr_work_mode_no_capture;
+	gptmr_channel_config(HPM_GPTMR1, 0u, &cfg, false);
+	gptmr_channel_reset_count(HPM_GPTMR1, 0u);
+	gptmr_start_counter(HPM_GPTMR1, 0u);
+
+	/* PE09 as plain GPIO input. */
+	HPM_IOC->PAD[IOC_PAD_PE09].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(0);
+	HPM_IOC->PAD[IOC_PAD_PE09].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
+
+	dshot_motor_data_set(0, (uint16_t)throttle, false);
+	up_dshot_arm(true);
+	usleep(100);
+
+	uint32_t ts[POLLSCAN_EDGES];
+	uint8_t lv[POLLSCAN_EDGES];
+	unsigned edges = 0;
+
+	up_dshot_trigger();
+
+	unsigned last = (HPM_GPIO0->DI[GPIO_DI_GPIOE].VALUE >> 9) & 1u;
+
+	for (uint32_t i = 0; i < 4000000u && edges < POLLSCAN_EDGES; i++) {
+		const unsigned now = (HPM_GPIO0->DI[GPIO_DI_GPIOE].VALUE >> 9) & 1u;
+
+		if (now != last) {
+			ts[edges] = HPM_GPTMR1->CHANNEL[0].CNT;
+			lv[edges] = (uint8_t)now;
+			edges++;
+			last = now;
+		}
+	}
+
+	up_dshot_arm(false);
+	gptmr_stop_counter(HPM_GPTMR1, 0u);
+
+	const uint32_t bit_ticks = 100000000u / (rate_kbit * 1000u);
+	uint16_t frame = 0;
+	unsigned bits = 0;
+	uint32_t rise = 0;
+	bool have_rise = false;
+
+	for (unsigned i = 0; i < edges && bits < 16u; i++) {
+		if (lv[i] == 1u) {
+			rise = ts[i];
+			have_rise = true;
+
+		} else if (have_rise) {
+			const uint32_t width = ts[i] - rise;
+			have_rise = false;
+			frame = (uint16_t)((frame << 1) | ((width > (bit_ticks / 2u)) ? 1u : 0u));
+			bits++;
+		}
+	}
+
+	PX4_INFO("pollscan: %u kbit/s, sent 0x%04x polled 0x%04x (%u bits, %u edges) -> %s",
+		 rate_kbit, (unsigned)sent, (unsigned)frame, bits, edges,
+		 (bits == 16u && frame == sent) ? "MATCH" : "MISMATCH");
+
+	for (unsigned i = 0; i + 1u < edges && i < 8u; i += 2u) {
+		PX4_INFO("pollscan: pulse %u rise %u fall %u width %u", i / 2u,
+			 (unsigned)ts[i], (unsigned)ts[i + 1u], (unsigned)(ts[i + 1u] - ts[i]));
+	}
+
+	return (bits == 16u && frame == sent) ? 0 : 1;
+}
 extern "C" int pwmv2test_main(int argc, char *argv[])
 {
 	uint32_t frequency = 1000;
@@ -2448,6 +2539,13 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 	unsigned dshot_rate = 600;
 	unsigned dshot_throttle = 0;
 	unsigned dshot_frames = 3000;   /* duration, ms */
+
+	if (argc > 1 && strcmp(argv[1], "pollscan") == 0) {
+		const unsigned rate = (argc > 2) ? strtoul(argv[2], nullptr, 0) : 50u;
+		const unsigned thr = (argc > 3) ? strtoul(argv[3], nullptr, 0) : 50u;
+
+		return pollscan_run(rate, thr);
+	}
 
 	if (argc > 1 && strcmp(argv[1], "gcapmseq") == 0) {
 		return gcapmseq_run(argc > 2 ? strtoul(argv[2], nullptr, 0) : 600u);
