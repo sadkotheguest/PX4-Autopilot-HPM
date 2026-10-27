@@ -171,6 +171,63 @@ static uint16_t dshot_frame_bits(unsigned throttle_percent)
 	return (uint16_t)((value << 4) | crc);
 }
 
+/* Build the cyclic DMA ring for one frame (same layout as dshot_run()). */
+static void dshot_fill_buf(uint32_t reload, unsigned throttle_percent)
+{
+	const uint16_t frame = dshot_frame_bits(throttle_percent);
+
+	for (int i = 1; i < 16; i++) {
+		dshot_buf[i - 1] = dshot_cmp(reload, (frame >> (15 - i)) & 1) << 8;
+	}
+
+	for (int i = 0; i < DSHOT_GAP_BITS; i++) {
+		dshot_buf[15 + i] = reload << 8;
+	}
+
+	dshot_buf[15 + DSHOT_GAP_BITS] = dshot_cmp(reload, (frame >> 15) & 1) << 8;
+}
+
+/* Offline check: frame bits and the DMA ring, no hardware access. */
+static int dshot_dump(uint32_t clock, unsigned rate_kbit, unsigned throttle_percent)
+{
+	if (rate_kbit != 150 && rate_kbit != 300 && rate_kbit != 600) {
+		PX4_ERR("dshot rate must be 150, 300 or 600 kbit/s");
+		return 1;
+	}
+
+	if (throttle_percent > 100) {
+		PX4_ERR("usage: pwmv2test dshotbuf [150|300|600] [throttle_pct]");
+		return 1;
+	}
+
+	const uint32_t bit_ns = 1000000000u / (rate_kbit * 1000u);
+	const uint32_t reload = (uint32_t)((uint64_t)clock * bit_ns / 1000000000ULL) - 1;
+	const uint16_t frame = dshot_frame_bits(throttle_percent);
+
+	dshot_fill_buf(reload, throttle_percent);
+
+	PX4_INFO("frame 0x%04x (value %u, throttle %u%%), reload %u, cmp1 %u, cmp0 %u",
+		 (unsigned)frame, (unsigned)(frame >> 4), throttle_percent, (unsigned)reload,
+		 (unsigned)dshot_cmp(reload, true), (unsigned)dshot_cmp(reload, false));
+
+	PX4_INFO("bits: %d%d%d%d %d%d%d%d %d%d%d%d %d%d%d%d",
+		 (frame >> 15) & 1, (frame >> 14) & 1, (frame >> 13) & 1, (frame >> 12) & 1,
+		 (frame >> 11) & 1, (frame >> 10) & 1, (frame >> 9) & 1, (frame >> 8) & 1,
+		 (frame >> 7) & 1, (frame >> 6) & 1, (frame >> 5) & 1, (frame >> 4) & 1,
+		 (frame >> 3) & 1, (frame >> 2) & 1, (frame >> 1) & 1, frame & 1);
+
+	PX4_INFO("ring[0..7] cmp: %u %u %u %u %u %u %u %u",
+		 (unsigned)(dshot_buf[0] >> 8), (unsigned)(dshot_buf[1] >> 8),
+		 (unsigned)(dshot_buf[2] >> 8), (unsigned)(dshot_buf[3] >> 8),
+		 (unsigned)(dshot_buf[4] >> 8), (unsigned)(dshot_buf[5] >> 8),
+		 (unsigned)(dshot_buf[6] >> 8), (unsigned)(dshot_buf[7] >> 8));
+	PX4_INFO("ring[15] gap cmp %u, ring[%u] bit0 cmp %u",
+		 (unsigned)(dshot_buf[15] >> 8), (unsigned)(15 + DSHOT_GAP_BITS),
+		 (unsigned)(dshot_buf[15 + DSHOT_GAP_BITS] >> 8));
+
+	return 0;
+}
+
 static void dshot_pins(void)
 {
 	HPM_IOC->PAD[IOC_PAD_PE08].FUNC_CTL = IOC_PE08_FUNC_CTL_PWM1_P_0;
@@ -327,11 +384,23 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 	unsigned pairs = 30;
 	bool loop = false;
 	bool dshot = false;
+	bool dshotbuf = false;
 	unsigned dshot_rate = 600;
 	unsigned dshot_throttle = 0;
 	unsigned dshot_frames = 3000;   /* duration, ms */
 
-	if (argc > 1 && strcmp(argv[1], "dshot") == 0) {
+	if (argc > 1 && strcmp(argv[1], "dshotbuf") == 0) {
+		dshotbuf = true;
+
+		if (argc > 2) {
+			dshot_rate = strtoul(argv[2], nullptr, 0);
+		}
+
+		if (argc > 3) {
+			dshot_throttle = strtoul(argv[3], nullptr, 0);
+		}
+
+	} else if (argc > 1 && strcmp(argv[1], "dshot") == 0) {
 		dshot = true;
 
 		if (argc > 2) {
@@ -363,7 +432,7 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 		}
 
 		if (frequency == 0 || duty_percent > 100) {
-			PX4_ERR("usage: pwmv2test [frequency_hz] [duty_percent] | loop [pairs] | dshot [150|300|600] [throttle_pct] [frames]");
+			PX4_ERR("usage: pwmv2test [frequency_hz] [duty_percent] | loop [pairs] | dshot [150|300|600] [throttle_pct] [duration_ms] | dshotbuf [150|300|600] [throttle_pct]");
 			return 1;
 		}
 	}
@@ -382,6 +451,10 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 	if (clock == 0) {
 		PX4_ERR("PWM1 clock is not running");
 		return 1;
+	}
+
+	if (dshotbuf) {
+		return dshot_dump(clock, dshot_rate, dshot_throttle);
 	}
 
 	if (dshot) {
