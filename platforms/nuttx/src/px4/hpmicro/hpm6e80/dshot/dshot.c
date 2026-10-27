@@ -1343,7 +1343,7 @@ bool up_dshot_rxi_get(uint32_t index, uint32_t *value, uint8_t *channel, bool *p
  * which register changed and when, without any interrupt per edge.
  */
 
-#define DSHOT_RXP_EVENTS    32u
+#define DSHOT_RXP_EVENTS    48u
 #define DSHOT_RXP_WORDS     (DSHOT_RXP_EVENTS * 2u)
 #define DSHOT_RXP_CHANNEL   3u          /* GPTMR0 channel 3 */
 #define DSHOT_RXP_TRGM_OUT  HPM_TRGM0_OUTPUT_SRC_GPTMR0_IN3
