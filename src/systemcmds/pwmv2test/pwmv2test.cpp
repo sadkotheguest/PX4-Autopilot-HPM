@@ -1888,6 +1888,8 @@ static int gcapd_run(unsigned rate_kbit, unsigned throttle_percent, bool chain)
 	bool have_rise = false;
 	uint16_t frame = 0;
 	unsigned bits = 0, edges = 0, pairs = 0;
+	uint32_t widths[24] = {};
+	unsigned nwidths = 0;
 
 	for (unsigned i = 0; i + 1u < words; i += 2u) {
 		const uint32_t pos = buf[i];
@@ -1945,6 +1947,10 @@ static int gcapd_run(unsigned rate_kbit, unsigned throttle_percent, bool chain)
 					continue;
 				}
 
+				if (nwidths < 24u) {
+					widths[nwidths++] = width;
+				}
+
 				if (bits < 16u) {
 					frame = (uint16_t)((frame << 1) | ((width > (bit_ticks / 2u)) ? 1u : 0u));
 					bits++;
@@ -1963,9 +1969,46 @@ static int gcapd_run(unsigned rate_kbit, unsigned throttle_percent, bool chain)
 		 bits, edges, pairs, (bits == 16u && frame == sent) ? "MATCH" : "MISMATCH");
 
 	if (buf) {
-		for (unsigned i = 0; i + 1u < words && i < 12u; i += 2u) {
-			PX4_INFO("gcapd: [%u] pos %u neg %u", i / 2u, (unsigned)buf[i], (unsigned)buf[i + 1u]);
+		unsigned shown = 0;
+
+		for (unsigned i = 0; i + 1u < words; i += 2u, shown++) {
+			if (buf[i] == 0u && buf[i + 1u] == 0u) {
+				break;
+			}
+
+			PX4_INFO("gcapd: [%2u] pos %10u neg %10u", shown,
+				 (unsigned)buf[i], (unsigned)buf[i + 1u]);
 		}
+	}
+
+	{
+		char wline[200];
+		int posn = 0;
+
+		for (unsigned i = 0; i < nwidths && posn < 180; i++) {
+			posn += snprintf(wline + posn, sizeof(wline) - posn, "%u ", (unsigned)widths[i]);
+		}
+
+		wline[posn] = 0;
+		PX4_INFO("gcapd: widths[%u]: %s", nwidths, wline);
+	}
+
+	{
+		char sline[40], rline[40];
+		int sp = 0, rp = 0;
+
+		for (int i = 15; i >= 0; i--) {
+			sp += snprintf(sline + sp, sizeof(sline) - sp, "%d", (sent >> i) & 1);
+		}
+
+		for (int i = 15; i >= 0; i--) {
+			rp += snprintf(rline + rp, sizeof(rline) - rp, "%d", (frame >> i) & 1);
+		}
+
+		sline[sp] = 0;
+		rline[rp] = 0;
+		PX4_INFO("gcapd: sent bits %s", sline);
+		PX4_INFO("gcapd: recv bits %s", rline);
 	}
 
 	return (bits == 16u && frame == sent) ? 0 : 1;

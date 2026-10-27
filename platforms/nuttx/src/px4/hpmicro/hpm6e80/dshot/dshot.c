@@ -227,6 +227,20 @@ static void dshot_pwm_init(void)
 	pwmv2_set_shadow_val(pwm, sh_period, reload, 0, false);
 	pwmv2_set_shadow_val(pwm, sh_edge, reload + 1, 0, false);
 
+	/* Trigger comparator for the DMA request: a constant point late in the
+	 * period, AFTER the pulse, so the duty shadow written by the DMA is applied
+	 * well before the next reload latches it (no race with the latch).
+	 */
+	const uint8_t sh_dma_trig = PWMV2_SHADOW_INDEX(4);
+	pwmv2_set_shadow_val(pwm, sh_dma_trig, reload - 8u, 0, false);
+
+	pwmv2_cmp_config_t cmp_trig = {};
+	cmp_trig.cmp = reload - 8u;
+	cmp_trig.cmp_source = cmp_value_from_shadow_val;
+	cmp_trig.cmp_source_index = sh_dma_trig;
+	cmp_trig.update_trigger = pwm_shadow_register_update_on_reload;
+	pwmv2_config_cmp(pwm, 8u, &cmp_trig);
+
 	pwmv2_counter_select_data_offset_from_shadow_value(pwm, counter, sh_period);
 	pwmv2_counter_burst_disable(pwm, counter);
 	pwmv2_set_reload_update_time(pwm, counter, pwm_reload_update_on_shlk);
