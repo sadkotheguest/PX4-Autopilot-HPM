@@ -370,3 +370,38 @@ Important constraints for the BDShot design:
 - Interrupt load is not a problem in practice: PX4 requests telemetry from one
   ESC at a time (round-robin), so the capture IRQ is only enabled for that
   motor's reply window (~21 edges per telemetry frame), not continuously.
+### bdscap: counter reset on the rising edge (STM32-style window)
+
+`pwmv2test bdscap <rate> <throttle>` implements the planned scheme:
+
+- PE09 -> TRGM.P[9] (mux alt 17), TRGM filter bypass;
+- TRGM output `PWM1_TRIG_IN0` <- `TRGM0_P09`;
+- `pwmv2_set_counter_reload_trigmux_index(counter0, 0)` so the counter restarts
+  on every rising edge;
+- capture input from TRGM (`CAPTURE_SELGPIO = 1`), and only the **falling edge**
+  interrupt is enabled, so one ISR per bit and `CAPTURE_NEG` should hold the
+  pulse width directly.
+
+Measured result:
+
+    600 kbit/s: bit 333 ticks -> entries pos 90 / neg 7 (constant)
+    150 kbit/s: bit 1333 ticks -> entries pos 840 / neg 7 (constant)
+
+So the status flags fire per edge, but the latched value still does not change
+within a frame (it is constant per bit rate).  Together with the earlier
+observations this means the PWMv2 capture value latch is not behaving as the UM
+describes in our configuration; the TRGM routing, the filter and the counter
+reset are all confirmed to be applied.
+
+Practical conclusion for BDShot:
+
+- GPTMR capture is the only path where we have seen the latched value change
+  per edge (it also supports DMA on the capture event); it can serve **one**
+  motor at a time, which is exactly what PX4 needs because telemetry is
+  requested from one ESC per frame and rotated (`select_next_capture_channel()`
+  in the STM32 port does the same).
+- Polling every channel is therefore not a limitation: with round-robin each
+  motor is sampled every N frames (N = number of motors), the same as on STM32.
+- PWMv2 capture would remove the pin restriction, but its value latch needs more
+  investigation (candidate causes: capture counter selection semantics, the
+  TRGM trigger interacting with the capture module, or a silicon/SDK quirk).

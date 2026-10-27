@@ -581,23 +581,34 @@ void up_dshot_capture_set_counter(unsigned index)
 	}
 }
 
-void up_dshot_capture_enable(bool enable)
+void up_dshot_capture_enable_edges(bool pos, bool neg)
 {
-	if (enable) {
-		for (unsigned ch = 0; ch < 8; ch++) {
-			if (cap_channels & (1u << ch)) {
+	for (unsigned ch = 0; ch < 8; ch++) {
+		if (cap_channels & (1u << ch)) {
+			if (pos) {
 				pwmv2_enable_capture_posedge_irq(pwm, (pwm_channel_t)ch);
-				pwmv2_enable_capture_nededge_irq(pwm, (pwm_channel_t)ch);
-			}
-		}
 
-	} else {
-		for (unsigned ch = 0; ch < 8; ch++) {
-			if (cap_channels & (1u << ch)) {
+			} else {
 				pwmv2_disable_capture_posedge_irq(pwm, (pwm_channel_t)ch);
+			}
+
+			if (neg) {
+				pwmv2_enable_capture_nededge_irq(pwm, (pwm_channel_t)ch);
+
+			} else {
 				pwmv2_disable_capture_nededge_irq(pwm, (pwm_channel_t)ch);
 			}
 		}
+	}
+}
+
+void up_dshot_capture_enable(bool enable)
+{
+	if (enable) {
+		up_dshot_capture_enable_edges(true, true);
+
+	} else {
+		up_dshot_capture_enable_edges(false, false);
 	}
 }
 
