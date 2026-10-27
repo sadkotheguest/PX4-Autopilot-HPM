@@ -1177,6 +1177,310 @@ static int bdscap_run(unsigned rate_kbit, unsigned throttle_percent)
 
 	return (bits == 16u && received == sent) ? 0 : 1;
 }
+/* ------------------------------------------------------------------------ */
+/* BDShot receive path: DMA samples GPIOE while the line is released, the    */
+/* samples are decoded offline (all four channels in parallel).              */
+/* ------------------------------------------------------------------------ */
+
+extern "C" int up_dshot_rx_init(unsigned sample_hz);
+extern "C" void up_dshot_rx_start(void);
+extern "C" void up_dshot_rx_stop(void);
+extern "C" bool up_dshot_rx_ready(void);
+extern "C" uint32_t up_dshot_rx_sample_rate(void);
+extern "C" const uint32_t *up_dshot_rx_buffer(void);
+extern "C" unsigned up_dshot_rx_samples(void);
+extern "C" unsigned up_dshot_rx_channel_mask(void);
+extern "C" void up_dshot_rx_restore_outputs(void);
+extern "C" void up_dshot_rx_deinit(void);
+
+/* Decode the sampled port words of one motor pin into DShot bits. */
+static uint16_t rx_decode_channel(const uint32_t *samples, unsigned count, unsigned pin,
+				  uint32_t sample_hz, unsigned rate_kbit, unsigned *bits_out,
+				  unsigned *edges_out)
+{
+	const uint32_t bit_time = sample_hz / (rate_kbit * 1000u);
+	const uint32_t threshold = bit_time / 2u;
+
+	uint32_t level = (samples[0] >> pin) & 1u;
+	uint32_t last_edge = 0;
+	uint16_t frame = 0;
+	unsigned bits = 0, edges = 0;
+
+	uint32_t high_samples = 0;
+	bool in_pulse = false;
+	uint32_t pulse_start = 0;
+
+	for (unsigned i = 1; i < count; i++) {
+		const uint32_t now = (samples[i] >> pin) & 1u;
+
+		if (now == level) {
+			continue;
+		}
+
+		level = now;
+		edges++;
+		last_edge = i;
+
+		if (level) {
+			pulse_start = i;
+			in_pulse = true;
+
+		} else if (in_pulse) {
+			high_samples = i - pulse_start;
+			in_pulse = false;
+
+			const bool bit = high_samples > threshold;
+
+			if (bits < 16u) {
+				frame = (uint16_t)((frame << 1) | (bit ? 1u : 0u));
+				bits++;
+			}
+		}
+	}
+
+	(void)last_edge;
+
+	*bits_out = bits;
+	*edges_out = edges;
+
+	return frame;
+}
+
+static int rxscan_run(unsigned rate_kbit, unsigned throttle_percent, unsigned sampler_hz)
+{
+	if (rate_kbit != 150 && rate_kbit != 300 && rate_kbit != 600) {
+		PX4_ERR("usage: pwmv2test rxscan [150|300|600] [throttle_pct]");
+		return 1;
+	}
+
+	up_dshot_deinit();
+	up_dshot_set_buffer_region(0);
+
+	if (up_dshot_init(0x1, rate_kbit * 1000u, false) != OK) {
+		PX4_ERR("rxscan: dshot init failed");
+		return 1;
+	}
+
+	up_dshot_rx_deinit();
+
+	if (up_dshot_rx_init(sampler_hz) != OK) {
+		PX4_ERR("rxscan: rx init failed");
+		return 1;
+	}
+
+	uint32_t throttle = 48u + throttle_percent * 2000u / 100u;
+
+	if (throttle > 2047u) {
+		throttle = 2047u;
+	}
+
+	/* PE09 monitors the wire through the jumper: it must be a GPIO input so
+	 * that the DI register of the port follows the pad.
+	 */
+	HPM_IOC->PAD[IOC_PAD_PE09].FUNC_CTL = IOC_PE09_FUNC_CTL_GPIO_E_09;
+	HPM_IOC->PAD[IOC_PAD_PE09].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
+	HPM_GPIO0->OE[4].CLEAR = 1u << 9;
+
+	dshot_motor_data_set(0, (uint16_t)throttle, false);
+	up_dshot_arm(true);
+	up_dshot_tc_reset();
+	const hrt_abstime t0 = hrt_absolute_time();
+	up_dshot_rx_start();
+	up_dshot_trigger();
+
+	uint32_t spin = 0;
+
+	while (spin++ < 4000000u && !up_dshot_rx_ready()) {
+	}
+
+	const uint32_t elapsed_us = hrt_elapsed_time(&t0);
+
+	up_dshot_rx_stop();
+	up_dshot_arm(false);
+	up_dshot_rx_restore_outputs();
+
+	const uint16_t packet = (uint16_t)((throttle << 1) & 0xFFFFu);
+	const uint16_t crc = (packet ^ (packet >> 4) ^ (packet >> 8)) & 0x0F;
+	const uint16_t sent = (uint16_t)((packet << 4) | crc);
+
+	const uint32_t *samples = up_dshot_rx_buffer();
+	const unsigned count = up_dshot_rx_samples();
+	const uint32_t sample_hz = up_dshot_rx_sample_rate();
+
+	unsigned bits = 0, edges = 0;
+	const uint16_t received = rx_decode_channel(samples, count, 9u, sample_hz, rate_kbit, &bits, &edges);
+
+	PX4_INFO("rxscan: %u kbit/s, throttle %u, frame 0x%04x, samples %u @ %u Hz, edges %u",
+		 rate_kbit, (unsigned)throttle, (unsigned)sent, count, (unsigned)sample_hz, edges);
+	PX4_INFO("rxscan: rx_ready %d, %u bits decoded 0x%04x -> %s (window %u us, effective %u Hz)",
+		 up_dshot_rx_ready() ? 1 : 0, bits, (unsigned)received,
+		 (bits == 16u && received == sent) ? "MATCH" : "MISMATCH",
+		 (unsigned)elapsed_us, (unsigned)(elapsed_us ? (count * 1000000ull / elapsed_us) : 0));
+
+	unsigned changes = 0;
+	uint32_t last = (samples[0] >> 9) & 1u;
+	unsigned shown = 0;
+
+	for (unsigned i = 1; i < count && shown < 24u; i++) {
+		const uint32_t now = (samples[i] >> 9) & 1u;
+
+		if (now != last) {
+			changes++;
+			PX4_INFO("rxscan: edge %u idx %u -> %u", changes, i, (unsigned)now);
+			last = now;
+			shown++;
+		}
+	}
+
+	for (unsigned i = 1; i < count; i++) {
+		if (((samples[i] >> 9) & 1u) != ((samples[i - 1] >> 9) & 1u)) {
+			changes++;
+		}
+	}
+
+	PX4_INFO("rxscan: shadow20 0x%08x (preload would be 0x%08x), UNLOCK 0x%08x, work_ctrl1 0x%08x",
+		 (unsigned)PWM_BASE->SHADOW_VAL[20], (unsigned)(PWM_BASE->SHADOW_VAL[20] & 0xFFFFFFFFu),
+		 (unsigned)PWM_BASE->UNLOCK, (unsigned)PWM_BASE->WORK_CTRL1);
+
+	PX4_INFO("rxscan: PE09 level changes %u, first samples %08x %08x %08x %08x",
+		 changes, (unsigned)samples[0], (unsigned)samples[1],
+		 (unsigned)samples[2], (unsigned)samples[3]);
+
+	return (bits == 16u && received == sent) ? 0 : 1;
+}
+
+static int rxscan_scan(void)
+{
+	static const unsigned rates[] = {150u, 300u, 600u};
+	static const unsigned throttles[] = {0u, 50u, 100u};
+
+	unsigned pass = 0, fail = 0;
+
+	for (unsigned r = 0; r < sizeof(rates) / sizeof(rates[0]); r++) {
+		for (unsigned t = 0; t < sizeof(throttles) / sizeof(throttles[0]); t++) {
+			const int ret = rxscan_run(rates[r], throttles[t], 8000000u);
+
+			if (ret == 0) {
+				pass++;
+
+			} else if (ret > 0) {
+				fail++;
+			}
+		}
+	}
+
+	up_dshot_rx_deinit();
+	PX4_INFO("rxscan: %u passed, %u failed", pass, fail);
+
+	return fail == 0 ? 0 : 1;
+}
+/* Slow GPIO loopback: drive PE08 as GPIO, read PE09 (jumper). */
+static int gpiotest_run(void)
+{
+	HPM_IOC->PAD[IOC_PAD_PE08].FUNC_CTL = IOC_PE08_FUNC_CTL_GPIO_E_08;
+	HPM_IOC->PAD[IOC_PAD_PE08].PAD_CTL = IOC_PAD_PAD_CTL_DS_SET(7) | IOC_PAD_PAD_CTL_SPD_SET(2);
+	HPM_IOC->PAD[IOC_PAD_PE09].FUNC_CTL = IOC_PE09_FUNC_CTL_GPIO_E_09;
+	HPM_IOC->PAD[IOC_PAD_PE09].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
+
+	HPM_GPIO0->OE[4].SET = 1u << 8;
+	HPM_GPIO0->OE[4].CLEAR = 1u << 9;
+
+	unsigned low = 0, high = 0;
+
+	for (unsigned i = 0; i < 200u; i++) {
+		HPM_GPIO0->DO[4].CLEAR = 1u << 8;
+		usleep(20);
+
+		if (((HPM_GPIO0->DI[4].VALUE >> 9) & 1u) == 0u) {
+			low++;
+		}
+
+		HPM_GPIO0->DO[4].SET = 1u << 8;
+		usleep(20);
+
+		if (((HPM_GPIO0->DI[4].VALUE >> 9) & 1u) == 1u) {
+			high++;
+		}
+	}
+
+	HPM_GPIO0->DO[4].CLEAR = 1u << 8;
+
+	PX4_INFO("gpiotest: PE09 low %u/200 high %u/200, DI=0x%08x DO=0x%08x OE=0x%08x",
+		 low, high, (unsigned)HPM_GPIO0->DI[4].VALUE,
+		 (unsigned)HPM_GPIO0->DO[4].VALUE, (unsigned)HPM_GPIO0->OE[4].VALUE);
+
+	return (low == 200u && high == 200u) ? 0 : 1;
+}
+/* Slow sampler check: 1 kHz PWM on PE08, DMA samples PE09 at 8 kHz. */
+static int rxslow_run(void)
+{
+	clock_add_to_group(clock_pwm1, 0);
+
+	const uint32_t clock = clock_get_frequency(clock_pwm1);
+	const uint32_t reload = clock / 1000u - 1;
+
+	pwmv2_deinit(PWM_BASE);
+	pwmv2_shadow_register_unlock(PWM_BASE);
+	pwmv2_set_shadow_val(PWM_BASE, PWMV2_SHADOW_INDEX(0), reload, 0, false);
+	pwmv2_set_shadow_val(PWM_BASE, PWMV2_SHADOW_INDEX(1), reload / 2u, 0, false);
+	pwmv2_set_shadow_val(PWM_BASE, PWMV2_SHADOW_INDEX(2), reload + 1u, 0, false);
+	pwmv2_counter_select_data_offset_from_shadow_value(PWM_BASE, pwm_counter_0, PWMV2_SHADOW_INDEX(0));
+	pwmv2_counter_burst_disable(PWM_BASE, pwm_counter_0);
+	pwmv2_set_reload_update_time(PWM_BASE, pwm_counter_0, pwm_reload_update_on_shlk);
+	pwmv2_select_cmp_source(PWM_BASE, 0, cmp_value_from_shadow_val, PWMV2_SHADOW_INDEX(1));
+	pwmv2_select_cmp_source(PWM_BASE, 1, cmp_value_from_shadow_val, PWMV2_SHADOW_INDEX(2));
+	pwmv2_shadow_register_lock(PWM_BASE);
+	pwmv2_issue_shadow_register_lock_event(PWM_BASE);
+	pwmv2_disable_four_cmp(PWM_BASE, pwm_channel_0);
+
+	HPM_IOC->PAD[IOC_PAD_PE08].FUNC_CTL = IOC_PE08_FUNC_CTL_PWM1_P_0;
+	HPM_IOC->PAD[IOC_PAD_PE08].PAD_CTL = IOC_PAD_PAD_CTL_DS_SET(7) | IOC_PAD_PAD_CTL_SPD_SET(2);
+	HPM_IOC->PAD[IOC_PAD_PE09].FUNC_CTL = IOC_PE09_FUNC_CTL_GPIO_E_09;
+	HPM_IOC->PAD[IOC_PAD_PE09].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
+	HPM_GPIO0->OE[4].CLEAR = 1u << 9;
+
+	pwmv2_channel_enable_output(PWM_BASE, pwm_channel_0);
+	pwmv2_reset_counter(PWM_BASE, pwm_counter_0);
+	pwmv2_enable_counter(PWM_BASE, pwm_counter_0);
+	pwmv2_start_pwm_output(PWM_BASE, pwm_counter_0);
+
+	if (up_dshot_rx_init(8000u) != OK) {
+		PX4_ERR("rxslow: rx init failed");
+		return 1;
+	}
+
+	up_dshot_rx_start();
+
+	uint32_t spin = 0;
+
+	while (spin++ < 8000000u && !up_dshot_rx_ready()) {
+	}
+
+	up_dshot_rx_stop();
+	pwmv2_disable_counter(PWM_BASE, pwm_counter_0);
+	pwmv2_channel_disable_output(PWM_BASE, pwm_channel_0);
+
+	const uint32_t *samples = up_dshot_rx_buffer();
+	const unsigned count = up_dshot_rx_samples();
+
+	unsigned changes = 0;
+	unsigned highs = 0;
+
+	for (unsigned i = 0; i < count; i++) {
+		if ((samples[i] >> 9) & 1u) {
+			highs++;
+		}
+
+		if (i && (((samples[i] >> 9) ^ (samples[i - 1] >> 9)) & 1u)) {
+			changes++;
+		}
+	}
+
+	PX4_INFO("rxslow: ready %d, samples %u, PE09 changes %u, highs %u/%u",
+		 up_dshot_rx_ready() ? 1 : 0, count, changes, highs, count);
+
+	return (changes > 10u && highs > 10u) ? 0 : 1;
+}
 extern "C" int pwmv2test_main(int argc, char *argv[])
 {
 	uint32_t frequency = 1000;
@@ -1191,6 +1495,39 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 	unsigned dshot_rate = 600;
 	unsigned dshot_throttle = 0;
 	unsigned dshot_frames = 3000;   /* duration, ms */
+
+	if (argc > 1 && strcmp(argv[1], "rxslow") == 0) {
+		return rxslow_run();
+	}
+
+	if (argc > 1 && strcmp(argv[1], "gpiotest") == 0) {
+		return gpiotest_run();
+	}
+
+	if (argc > 1 && strcmp(argv[1], "rxscan") == 0) {
+		if (argc > 2 && strcmp(argv[2], "all") == 0) {
+			return rxscan_scan();
+		}
+
+		unsigned rate = 600;
+		unsigned thr = 50;
+
+		if (argc > 2) {
+			rate = strtoul(argv[2], nullptr, 0);
+		}
+
+		unsigned sampler = 8000000u;
+
+		if (argc > 3) {
+			thr = strtoul(argv[3], nullptr, 0);
+		}
+
+		if (argc > 4) {
+			sampler = strtoul(argv[4], nullptr, 0);
+		}
+
+		return rxscan_run(rate, thr, sampler);
+	}
 
 	if (argc > 1 && strcmp(argv[1], "bdscap") == 0) {
 		unsigned rate = 600;

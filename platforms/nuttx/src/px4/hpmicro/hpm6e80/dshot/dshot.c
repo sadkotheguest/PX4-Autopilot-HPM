@@ -201,8 +201,25 @@ static void dshot_pwm_init(void)
 		pwm->UNLOCK |= (1u << (2u + shadow));
 
 		pwmv2_set_shadow_val(pwm, shadow, reload, 0, false);
-		pwmv2_select_cmp_source(pwm, 2 * ch, cmp_value_from_shadow_val, shadow);
-		pwmv2_select_cmp_source(pwm, 2 * ch + 1, cmp_value_from_shadow_val, sh_edge);
+
+		/* The comparator has to reload its working value from the shadow on
+		 * every counter period, otherwise the duty written by the DMA for the
+		 * next bit never reaches the output.
+		 */
+		pwmv2_cmp_config_t cmp = {};
+		cmp.cmp = reload;
+		cmp.cmp_source = cmp_value_from_shadow_val;
+		cmp.cmp_source_index = shadow;
+		cmp.update_trigger = pwm_shadow_register_update_on_reload;
+		pwmv2_config_cmp(pwm, 2 * ch, &cmp);
+
+		pwmv2_cmp_config_t cmp_edge = {};
+		cmp_edge.cmp = reload + 1u;
+		cmp_edge.cmp_source = cmp_value_from_shadow_val;
+		cmp_edge.cmp_source_index = sh_edge;
+		cmp_edge.update_trigger = pwm_shadow_register_update_on_reload;
+		pwmv2_config_cmp(pwm, 2 * ch + 1, &cmp_edge);
+
 		pwmv2_disable_four_cmp(pwm, dshot_channels[ch]);
 	}
 
@@ -650,6 +667,219 @@ bool up_dshot_capture_get(uint32_t index, uint32_t *value, uint8_t *channel, boo
 	return true;
 }
 
+/* ---------------------------------------------------------------------- */
+/* BDShot receive: DMA samples the whole GPIO port into RAM                */
+/* ---------------------------------------------------------------------- */
+/*
+ * Instead of latching individual edges (PWMv2 capture has no DMA request and
+ * GPTMR capture is only available on a few pads), a second DMA channel samples
+ * the input data register of the motor port at a fixed rate.  One 32-bit word
+ * carries the level of ALL motor pins, so every channel is captured in
+ * parallel, without any per-edge interrupt.  The samples are decoded offline.
+ */
+
+#define DSHOT_RX_PORT        4u          /* GPIO port E (PE08..PE11) */
+#define DSHOT_RX_SAMPLES     512u        /* 512 * 4 B = 2 KiB          */
+#define DSHOT_RX_MASK        (0xFu << 8) /* PE08..PE11                 */
+
+static const uint32_t rx_sample_clock_hz = 8000000u;
+
+static uint32_t rx_buf[DSHOT_RX_SAMPLES] __attribute__((section(".ahb_sram")));
+
+static dma_resource_t rx_res;
+static dma_mgr_chn_conf_t rx_conf;
+static bool rx_allocated;
+static bool rx_ready;
+static volatile uint32_t rx_tc_count;
+
+static uint8_t rx_pad_func[DSHOT_MAX_CHANNELS];
+static uint32_t rx_sample_hz;
+
+static void dshot_rx_tc_cb(DMA_Type *base, uint32_t channel, void *cb_data)
+{
+	(void)base;
+	(void)channel;
+	(void)cb_data;
+
+	pwmv2_disable_counter(pwm, pwm_counter_1);
+	rx_ready = true;
+	rx_tc_count++;
+}
+
+static void dshot_rx_pins_input(void)
+{
+	for (unsigned ch = 0; ch < num_channels; ch++) {
+		uint32_t pin = 8u + ch;
+
+		HPM_IOC->PAD[IOC_PAD_PE08 + pin - 8u].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(0);
+		HPM_IOC->PAD[IOC_PAD_PE08 + pin - 8u].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
+	}
+
+	/* All four motor pins as GPIO inputs. */
+	HPM_GPIO0->OE[DSHOT_RX_PORT].CLEAR = DSHOT_RX_MASK;
+}
+
+static void dshot_rx_pins_output(void)
+{
+	static const uint32_t pwm_func[DSHOT_MAX_CHANNELS] = {
+		IOC_PE08_FUNC_CTL_PWM1_P_0, IOC_PE09_FUNC_CTL_PWM1_P_1,
+		IOC_PE10_FUNC_CTL_PWM1_P_2, IOC_PE11_FUNC_CTL_PWM1_P_3
+	};
+
+	for (unsigned ch = 0; ch < num_channels; ch++) {
+		HPM_IOC->PAD[IOC_PAD_PE08 + ch].FUNC_CTL = pwm_func[ch];
+		HPM_IOC->PAD[IOC_PAD_PE08 + ch].PAD_CTL =
+			IOC_PAD_PAD_CTL_DS_SET(7) | IOC_PAD_PAD_CTL_SPD_SET(2);
+	}
+}
+
+int up_dshot_rx_init(unsigned sample_hz)
+{
+	if (sample_hz == 0) {
+		return -EINVAL;
+	}
+
+	if (rx_allocated) {
+		return OK;
+	}
+
+	/* Sample clock: PWM1 counter 1 reloads at the sample rate (free running). */
+	const uint32_t clock = clock_get_frequency(clock_pwm1);
+
+	if (clock == 0) {
+		return -EIO;
+	}
+
+	pwmv2_shadow_register_unlock(pwm);
+	pwmv2_set_shadow_val(pwm, PWMV2_SHADOW_INDEX(3), clock / sample_hz, 0, false);
+	pwmv2_counter_select_data_offset_from_shadow_value(pwm, pwm_counter_1, PWMV2_SHADOW_INDEX(3));
+	pwmv2_counter_burst_disable(pwm, pwm_counter_1);
+	pwmv2_set_reload_update_time(pwm, pwm_counter_1, pwm_reload_update_on_shlk);
+	pwmv2_shadow_register_lock(pwm);
+	pwmv2_issue_shadow_register_lock_event(pwm);
+
+	trgm_dma_request_config(HPM_TRGM0, TRGM_DMACFG_1, HPM_TRGM0_DMA_SRC_PWM1_REQ1);
+
+	dma_mgr_init();
+
+	if (dma_mgr_request_resource(&rx_res) != status_success) {
+		return -ENODEV;
+	}
+
+	rx_allocated = true;
+
+	dma_mgr_get_default_chn_config(&rx_conf);
+	rx_conf.en_dmamux = true;
+	rx_conf.dmamux_src = HPM_DMA_SRC_MOT_1;
+	rx_conf.src_mode = 1;                       /* peripheral request */
+	rx_conf.dst_mode = 0;
+	rx_conf.src_width = DMA_TRANSFER_WIDTH_WORD;
+	rx_conf.dst_width = DMA_TRANSFER_WIDTH_WORD;
+	rx_conf.src_addr_ctrl = 2;                  /* fixed: GPIO input register */
+	rx_conf.dst_addr_ctrl = 0;                  /* increment */
+	rx_conf.src_burst_size = DMA_NUM_TRANSFER_PER_BURST_1T;
+	rx_conf.src_addr = (uint32_t)&HPM_GPIO0->DI[DSHOT_RX_PORT].VALUE;
+	rx_conf.dst_addr = (uint32_t)rx_buf;
+	rx_conf.size_in_byte = sizeof(rx_buf);
+	rx_conf.en_infiniteloop = false;
+	rx_conf.handshake_opt = DMA_HANDSHAKE_OPT_ONE_BURST;
+	rx_conf.interrupt_mask = DMA_INTERRUPT_MASK_ALL & ~DMA_INTERRUPT_MASK_TERMINAL_COUNT;
+
+	if (dma_mgr_setup_channel(&rx_res, &rx_conf) != status_success) {
+		return -EIO;
+	}
+
+	if (dma_mgr_install_chn_tc_callback(&rx_res, dshot_rx_tc_cb, NULL) != status_success) {
+		return -EIO;
+	}
+
+	/* The request is enabled once; sampling only advances while counter 1 runs. */
+	pwmv2_enable_dma_at_reload_point(pwm, pwm_dma_1, pwm_counter_1);
+
+	rx_sample_hz = sample_hz;
+
+	return OK;
+}
+
+void up_dshot_rx_start(void)
+{
+	if (!rx_allocated) {
+		return;
+	}
+
+	/* Pads stay on their PWM function here so that the sampled data also
+	 * covers the case where the line is still driven (self-test); the caller
+	 * releases the outputs before enabling the reception of an ESC reply.
+	 */
+
+	rx_ready = false;
+	dma_clear_transfer_status(rx_res.base, rx_res.channel);
+
+	if (dma_mgr_setup_channel(&rx_res, &rx_conf) != status_success) {
+		return;
+	}
+
+	if (dma_mgr_enable_channel(&rx_res) != status_success) {
+		return;
+	}
+
+	pwmv2_reset_counter(pwm, pwm_counter_1);
+	pwmv2_enable_counter(pwm, pwm_counter_1);
+}
+
+void up_dshot_rx_stop(void)
+{
+	if (!rx_allocated) {
+		return;
+	}
+
+	pwmv2_disable_counter(pwm, pwm_counter_1);
+	dma_mgr_disable_channel(&rx_res);
+}
+
+bool up_dshot_rx_ready(void)
+{
+	return rx_ready;
+}
+
+uint32_t up_dshot_rx_sample_rate(void)
+{
+	return rx_sample_hz;
+}
+
+const uint32_t *up_dshot_rx_buffer(void)
+{
+	return rx_buf;
+}
+
+unsigned up_dshot_rx_samples(void)
+{
+	return DSHOT_RX_SAMPLES;
+}
+
+unsigned up_dshot_rx_channel_mask(void)
+{
+	return DSHOT_RX_MASK;
+}
+
+void up_dshot_rx_restore_outputs(void)
+{
+	dshot_rx_pins_output();
+}
+
+void up_dshot_rx_deinit(void)
+{
+	if (!rx_allocated) {
+		return;
+	}
+
+	pwmv2_disable_dma_at_reload_point(pwm, pwm_dma_1);
+	pwmv2_disable_counter(pwm, pwm_counter_1);
+	dma_mgr_disable_channel(&rx_res);
+	dma_mgr_release_resource(&rx_res);
+	rx_allocated = false;
+	rx_ready = false;
+}
 /* Bidirectional DShot is not implemented yet; keep the API consistent. */
 int up_bdshot_num_erpm_ready(void) { return 0; }
 int up_bdshot_get_erpm(uint8_t channel, int *erpm) { (void)channel; if (erpm) { *erpm = 0; } return -ENOSYS; }
