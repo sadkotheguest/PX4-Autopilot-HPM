@@ -232,8 +232,8 @@ static int dshot_run(uint32_t clock, unsigned rate_kbit, unsigned throttle_perce
 
 	pwmv2_shadow_register_lock(PWM_BASE);
 
-	/* One DMA request per period: comparator 1 hits at the period edge. */
-	pwmv2_enable_dma_at_compare_point(PWM_BASE, pwm_dma_0, DSHOT_CMP_EDGE0);
+	/* One DMA request per period: the counter 0 reload feeds pwm_dma_0. */
+	pwmv2_enable_dma_at_reload_point(PWM_BASE, pwm_dma_0, DSHOT_COUNTER);
 
 	pwmv2_disable_four_cmp(PWM_BASE, pwm_channel_0);
 	pwmv2_channel_enable_output(PWM_BASE, pwm_channel_0);
@@ -269,6 +269,7 @@ static int dshot_run(uint32_t clock, unsigned rate_kbit, unsigned throttle_perce
 	conf.dst_addr = (uint32_t)&PWM_BASE->SHADOW_VAL[DSHOT_DUTY_SHADOW];
 	conf.interrupt_mask = 0;
 	conf.en_infiniteloop = true;
+	conf.handshake_opt = DMA_HANDSHAKE_OPT_ONE_BURST;
 
 	if (dma_mgr_setup_channel(&dma_res, &conf) != status_success) {
 		PX4_ERR("dma_mgr_setup_channel failed");
@@ -284,9 +285,6 @@ static int dshot_run(uint32_t clock, unsigned rate_kbit, unsigned throttle_perce
 		 (int)conf.en_dmamux, (unsigned)conf.dmamux_src,
 		 (unsigned)conf.dst_addr, (unsigned)conf.size_in_byte);
 
-	/* Write probe: are the DMAMUX registers writable at all? */
-	HPM_DMAMUX->MUXCFG[0] = 0x80000064u;
-	PX4_INFO("mux probe readback=0x%08x", (unsigned)HPM_DMAMUX->MUXCFG[0]);
 
 	/* While the stream runs, sample the duty shadow: DMA must be cycling
 	 * through the "0" and "1" comparator values.
