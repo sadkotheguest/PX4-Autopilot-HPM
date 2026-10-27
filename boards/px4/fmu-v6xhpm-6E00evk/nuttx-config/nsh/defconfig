@@ -210,3 +210,6 @@ CONFIG_HPM_SPI7=y
 
 # PWM: PWMv2 through the PX4 io_timer layer (PWM1 channels 0..3 on PE08..PE11)
 CONFIG_HPM_PWM1=y
+
+# DMA (HDMA): needed by the PWMv2 DShot bring-up (PWM DMA request via TRGM)
+CONFIG_HPM_DMA=y

@@ -50,6 +50,8 @@
  * Usage:
  *   pwmv2test [frequency_hz] [duty_percent]
  *   pwmv2test loop [pairs]        (1 s of 1 kHz 20 %, then 1 s of 2 kHz 80 %)
+ *   pwmv2test dshot [150|300|600] [throttle_pct] [duration_ms]
+ *                                 (DShot bit stream through PWMv2 + DMA)
  */
 
 #include <px4_platform_common/px4_config.h>
@@ -62,6 +64,12 @@
 #include "hpm_clock_drv.h"
 #include "hpm_ioc_regs.h"
 #include "hpm_iomux.h"
+#include "hpm_dma_mgr.h"
+#include "hpm_dmav2_drv.h"
+#include "hpm_dmamux_src.h"
+#include "hpm_dmamux_drv.h"
+#include "hpm_trgm_drv.h"
+#include "hpm_trgmmux_src.h"
 
 static PWMV2_Type *const PWM_BASE = HPM_PWM1;
 
@@ -119,14 +127,202 @@ static void pwm_apply(uint32_t clock, uint32_t frequency, unsigned duty_percent)
 	set_duty(reload, duty_percent);
 }
 
+/* ------------------------------------------------------------------------ */
+/* DShot bring-up: PWMv2 generates the bit stream, DMA feeds the duty shadow */
+/* ------------------------------------------------------------------------ */
+
+static constexpr uint8_t DSHOT_GAP_BITS = 60;
+static uint32_t dshot_buf[16 + DSHOT_GAP_BITS];
+
+/* Comparator 0 counts down from the period: 75 % for a "1", 37.5 % for a "0". */
+static uint32_t dshot_cmp(uint32_t reload, bool bit)
+{
+	const uint32_t duty = bit ? (reload * 3u / 4u) : (reload * 3u / 8u);
+
+	return reload - duty;
+}
+
+/* 11 bit throttle + 1 telemetry request bit + 4 bit CRC. */
+static uint16_t dshot_frame_bits(unsigned throttle_percent)
+{
+	uint32_t throttle = 48u + (uint32_t)throttle_percent * 2000u / 100u;
+
+	if (throttle > 2047u) {
+		throttle = 2047u;
+	}
+
+	const uint16_t value = (uint16_t)(throttle << 1);      /* telemetry request = 0 */
+	const uint16_t crc = (value ^ (value >> 4) ^ (value >> 8)) & 0x0F;
+
+	return (uint16_t)((value << 4) | crc);
+}
+
+static int dshot_run(uint32_t clock, unsigned rate_kbit, unsigned throttle_percent, unsigned frames)
+{
+	if (rate_kbit != 150 && rate_kbit != 300 && rate_kbit != 600) {
+		PX4_ERR("dshot rate must be 150, 300 or 600 kbit/s");
+		return 1;
+	}
+
+	if (throttle_percent > 100 || frames == 0) {
+		PX4_ERR("usage: pwmv2test dshot [150|300|600] [throttle_pct] [duration_ms]");
+		return 1;
+	}
+
+	/* Bit period in counter ticks. */
+	const uint32_t bit_ns = 1000000000u / (rate_kbit * 1000u);
+	const uint32_t reload = (uint32_t)((uint64_t)clock * bit_ns / 1000000000ULL) - 1;
+	const uint16_t frame = dshot_frame_bits(throttle_percent);
+
+	/* A value written by DMA at the end of period N is latched at reload N+1,
+	 * so bit 0 is preloaded and the buffer starts with bit 1.  The trailing
+	 * zero-duty entries provide the inter-frame gap.
+	 */
+	/* The DMA writes the value for the *next* period, so the buffer starts
+	 * with bit 1; bit 0 is preloaded and also appended at the end so that the
+	 * cyclic buffer keeps every frame aligned.
+	 */
+	for (int i = 1; i < 16; i++) {
+		dshot_buf[i - 1] = dshot_cmp(reload, (frame >> (15 - i)) & 1) << 8;
+	}
+
+	for (int i = 0; i < DSHOT_GAP_BITS; i++) {
+		dshot_buf[15 + i] = reload << 8;
+	}
+
+	dshot_buf[15 + DSHOT_GAP_BITS] = dshot_cmp(reload, (frame >> 15) & 1) << 8;
+
+	pwmv2_deinit(PWM_BASE);
+	pwmv2_shadow_register_unlock(PWM_BASE);
+
+	pwmv2_set_shadow_val(PWM_BASE, PWM_PERIOD_SHADOW, reload, 0, false);
+	pwmv2_set_shadow_val(PWM_BASE, PWM_DUTY_SHADOW, dshot_cmp(reload, (frame >> 15) & 1), 0, false);
+	pwmv2_set_shadow_val(PWM_BASE, PWM_PERIOD_CMP_SHADOW, reload + 1, 0, false);
+
+	pwmv2_counter_select_data_offset_from_shadow_value(PWM_BASE, PWM_COUNTER, PWM_PERIOD_SHADOW);
+	pwmv2_counter_burst_disable(PWM_BASE, PWM_COUNTER);
+	pwmv2_set_reload_update_time(PWM_BASE, PWM_COUNTER, pwm_reload_update_on_reload);
+
+	pwmv2_select_cmp_source(PWM_BASE, PWM_CMP0, cmp_value_from_shadow_val, PWM_DUTY_SHADOW);
+	pwmv2_select_cmp_source(PWM_BASE, PWM_CMP1, cmp_value_from_shadow_val, PWM_PERIOD_CMP_SHADOW);
+
+	pwmv2_shadow_register_lock(PWM_BASE);
+
+	/* One DMA request per period: comparator 1 hits at the period edge. */
+	pwmv2_enable_dma_at_compare_point(PWM_BASE, pwm_dma_0, PWM_CMP1);
+
+	pwmv2_disable_four_cmp(PWM_BASE, (pwm_channel_t)(PWM_CHANNEL & ~1));
+	pwmv2_channel_enable_output(PWM_BASE, PWM_CHANNEL);
+
+	pwmv2_enable_counter(PWM_BASE, PWM_COUNTER);
+	pwmv2_start_pwm_output(PWM_BASE, PWM_COUNTER);
+
+	/* Route the PWM DMA request through TRGM to a DMAMUX source for HDMA. */
+	trgm_dma_request_config(HPM_TRGM0, TRGM_DMACFG_0, HPM_TRGM0_DMA_SRC_PWM1_REQ0);
+
+	dma_mgr_init();
+
+	dma_resource_t dma_res;
+
+	if (dma_mgr_request_resource(&dma_res) != status_success) {
+		PX4_ERR("no DMA channel");
+		return 1;
+	}
+
+	dma_mgr_chn_conf_t conf;
+	dma_mgr_get_default_chn_config(&conf);
+	conf.en_dmamux = true;
+	conf.dmamux_src = HPM_DMA_SRC_MOT_0;
+	conf.src_mode = 0;                      /* normal */
+	conf.dst_mode = 1;                      /* handshake */
+	conf.src_width = DMA_TRANSFER_WIDTH_WORD;
+	conf.dst_width = DMA_TRANSFER_WIDTH_WORD;
+	conf.src_addr_ctrl = 0;                 /* increment */
+	conf.dst_addr_ctrl = 2;                 /* fixed */
+	conf.size_in_byte = sizeof(dshot_buf);
+	conf.src_addr = (uint32_t)dshot_buf;
+	conf.dst_addr = (uint32_t)&PWM_BASE->SHADOW_VAL[PWM_DUTY_SHADOW];
+	conf.interrupt_mask = 0;
+	conf.en_infiniteloop = true;
+
+	if (dma_mgr_setup_channel(&dma_res, &conf) != status_success) {
+		PX4_ERR("dma_mgr_setup_channel failed");
+		return 1;
+	}
+
+	if (dma_mgr_enable_channel(&dma_res) != status_success) {
+		PX4_ERR("dma_mgr_enable_channel failed");
+		return 1;
+	}
+
+	PX4_INFO("conf: en_dmamux=%d src=0x%02x dst=0x%08x size=%u",
+		 (int)conf.en_dmamux, (unsigned)conf.dmamux_src,
+		 (unsigned)conf.dst_addr, (unsigned)conf.size_in_byte);
+
+	/* Write probe: are the DMAMUX registers writable at all? */
+	HPM_DMAMUX->MUXCFG[0] = 0x80000064u;
+	PX4_INFO("mux probe readback=0x%08x", (unsigned)HPM_DMAMUX->MUXCFG[0]);
+	/* While the stream runs, sample the duty shadow: DMA must be cycling
+	 * through the "0" and "1" comparator values.
+	 */
+	uint32_t shadow_min = 0xFFFFFFFFu, shadow_max = 0;
+
+	for (unsigned ms = 0; ms < frames; ms++) {
+		const uint32_t shadow = PWM_BASE->SHADOW_VAL[PWM_DUTY_SHADOW] >> 8;
+
+		if (shadow < shadow_min) {
+			shadow_min = shadow;
+		}
+
+		if (shadow > shadow_max) {
+			shadow_max = shadow;
+		}
+
+		usleep(1000);
+	}
+
+	dma_mgr_disable_channel(&dma_res);
+	pwmv2_disable_counter(PWM_BASE, PWM_COUNTER);
+	pwmv2_channel_disable_output(PWM_BASE, PWM_CHANNEL);
+
+	PX4_INFO("dshot %u kbit/s, throttle %u%%, reload %u, frame 0x%04x, %u ms, DMA ch %d",
+		 rate_kbit, throttle_percent, (unsigned)reload, (unsigned)frame, frames, (int)dma_res.channel);
+	PX4_INFO("shadow min/max %u/%u (expect %u/%u), cnt %u", (unsigned)shadow_min, (unsigned)shadow_max,
+		 (unsigned)dshot_cmp(reload, false), (unsigned)dshot_cmp(reload, true),
+		 (unsigned)PWM_BASE->CNT_VAL[PWM_COUNTER]);
+	PX4_INFO("buf: %u %u %u ... %u", (unsigned)dshot_buf[0], (unsigned)dshot_buf[1],
+		 (unsigned)dshot_buf[2], (unsigned)dshot_buf[15 + DSHOT_GAP_BITS]);
+
+	return 0;
+}
+
 extern "C" int pwmv2test_main(int argc, char *argv[])
 {
 	uint32_t frequency = 1000;
 	unsigned duty_percent = 50;
 	unsigned pairs = 30;
 	bool loop = false;
+	bool dshot = false;
+	unsigned dshot_rate = 600;
+	unsigned dshot_throttle = 0;
+	unsigned dshot_frames = 3000;   /* duration, ms */
 
-	if (argc > 1 && strcmp(argv[1], "loop") == 0) {
+	if (argc > 1 && strcmp(argv[1], "dshot") == 0) {
+		dshot = true;
+
+		if (argc > 2) {
+			dshot_rate = strtoul(argv[2], nullptr, 0);
+		}
+
+		if (argc > 3) {
+			dshot_throttle = strtoul(argv[3], nullptr, 0);
+		}
+
+		if (argc > 4) {
+			dshot_frames = strtoul(argv[4], nullptr, 0);
+		}
+
+	} else if (argc > 1 && strcmp(argv[1], "loop") == 0) {
 		loop = true;
 
 		if (argc > 2) {
@@ -143,7 +339,7 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 		}
 
 		if (frequency == 0 || duty_percent > 100) {
-			PX4_ERR("usage: pwmv2test [frequency_hz] [duty_percent] | loop [pairs]");
+			PX4_ERR("usage: pwmv2test [frequency_hz] [duty_percent] | loop [pairs] | dshot [150|300|600] [throttle_pct] [frames]");
 			return 1;
 		}
 	}
@@ -162,6 +358,10 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 	if (clock == 0) {
 		PX4_ERR("PWM1 clock is not running");
 		return 1;
+	}
+
+	if (dshot) {
+		return dshot_run(clock, dshot_rate, dshot_throttle, dshot_frames);
 	}
 
 	if (loop) {

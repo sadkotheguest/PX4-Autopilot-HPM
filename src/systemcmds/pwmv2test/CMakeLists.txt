@@ -36,6 +36,7 @@ px4_add_module(
 	MAIN pwmv2test
 	STACK_MAIN 2048
 	COMPILE_FLAGS
+		-DHPMSOC_HAS_HPMSDK_DMAV2
 	SRCS
 		pwmv2test.cpp
 	)
