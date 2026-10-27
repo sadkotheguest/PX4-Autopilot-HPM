@@ -547,18 +547,83 @@ static int dmadiag_run(uint32_t clock, unsigned freq_hz, unsigned words, const c
 /* Capture self-test: PE08 sends a DShot frame, PE09 (jumper) captures it.   */
 /* ------------------------------------------------------------------------ */
 
-static int captest_run(unsigned rate_kbit, unsigned throttle_percent, int cap_sel)
+/* ------------------------------------------------------------------------ */
+/* Capture self-test: PE08 sends a DShot frame, PE09 (jumper) captures it.   */
+/* The capture path is interrupt driven: one entry per edge in a ring buffer.*/
+/* ------------------------------------------------------------------------ */
+
+extern "C" int up_dshot_capture_init(uint32_t channel_mask);
+extern "C" void up_dshot_capture_enable(bool enable);
+extern "C" void up_dshot_capture_reset(void);
+extern "C" uint32_t up_dshot_capture_count(void);
+extern "C" uint32_t up_dshot_capture_dropped(void);
+extern "C" bool up_dshot_capture_get(uint32_t index, uint32_t *value, uint8_t *channel, bool *posedge);
+
+static uint16_t cap_decode(uint32_t reload, bool invert, unsigned *bits_out, unsigned *pairs_out)
 {
-	if (rate_kbit != 150 && rate_kbit != 300 && rate_kbit != 600) {
-		PX4_ERR("usage: pwmv2test captest [150|300|600] [throttle_pct]");
-		return 1;
+	uint32_t pos_value = 0;
+	bool have_pos = false;
+	uint16_t frame = 0;
+	unsigned bits = 0, pairs = 0;
+
+	const uint32_t count = up_dshot_capture_count();
+
+	for (uint32_t i = 0; i < count; i++) {
+		uint32_t value = 0;
+		uint8_t channel = 0;
+		bool posedge = false;
+
+		if (!up_dshot_capture_get(i, &value, &channel, &posedge)) {
+			break;
+		}
+
+		if (channel != 1u) {
+			continue;
+		}
+
+		if (posedge) {
+			pos_value = value;
+			have_pos = true;
+			continue;
+		}
+
+		if (!have_pos) {
+			continue;
+		}
+
+		const uint32_t width = invert ? ((value - pos_value) & 0xFFFFFFu)
+					: ((pos_value - value) & 0xFFFFFFu);
+		const bool bit = width > (reload / 2u);
+
+		frame = (uint16_t)((frame << 1) | (bit ? 1u : 0u));
+		bits++;
+		pairs++;
+		have_pos = false;
+
+		if (bits >= 16u) {
+			break;
+		}
 	}
 
+	*bits_out = bits;
+	*pairs_out = pairs;
+
+	return frame;
+}
+
+static int cap_send_and_check(unsigned rate_kbit, unsigned throttle_percent, bool verbose)
+{
+	if (rate_kbit != 150 && rate_kbit != 300 && rate_kbit != 600) {
+		PX4_ERR("rate must be 150, 300 or 600 kbit/s");
+		return -1;
+	}
+
+	up_dshot_deinit();
 	up_dshot_set_buffer_region(0);
 
 	if (up_dshot_init(0x1, rate_kbit * 1000u, false) != OK) {
-		PX4_ERR("captest: dshot init failed");
-		return 1;
+		PX4_ERR("dshot init failed");
+		return -1;
 	}
 
 	/* PE09 must stay on its PWM input function: the capture input comes from
@@ -567,16 +632,12 @@ static int captest_run(unsigned rate_kbit, unsigned throttle_percent, int cap_se
 	HPM_IOC->PAD[IOC_PAD_PE09].FUNC_CTL = IOC_PE09_FUNC_CTL_PWM1_P_1;
 	HPM_IOC->PAD[IOC_PAD_PE09].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
 
-	pwmv2_capture_selection_input_source(PWM_BASE, pwm_channel_1, (pwm_capture_input_select_t)(cap_sel ? 1 : 0));
-	pwmv2_set_capture_counter_index(PWM_BASE, pwm_channel_1, 0);
+	if (up_dshot_capture_init(0x2) != OK) {
+		PX4_ERR("capture init failed");
+		return -1;
+	}
 
-	pwmv2_cmp_config_t cfg = {};
-	cfg.mode = 1;                                  /* input capture */
-	cfg.cmp_source = cmp_value_from_capture_posedge;
-	pwmv2_config_cmp(PWM_BASE, 2, &cfg);
-
-	pwmv2_clear_capture_posedge_irq_status(PWM_BASE, 0xFFFFFFFFu);
-	pwmv2_clear_capture_negedge_irq_status(PWM_BASE, 0xFFFFFFFFu);
+	up_dshot_capture_enable(true);
 
 	uint32_t throttle = 48u + throttle_percent * 2000u / 100u;
 
@@ -587,88 +648,82 @@ static int captest_run(unsigned rate_kbit, unsigned throttle_percent, int cap_se
 	dshot_motor_data_set(0, (uint16_t)throttle, false);
 	up_dshot_arm(true);
 	up_dshot_tc_reset();
+	up_dshot_capture_reset();
 	up_dshot_trigger();
 
-	uint32_t pos[64];
-	uint32_t neg[64];
-	unsigned npos = 0, nneg = 0;
+	uint32_t spin = 0;
 
-	for (unsigned i = 0; i < 400000u && npos < 20u && nneg < 20u; i++) {
-		const uint32_t sp = pwmv2_get_capture_posedge_irq_status(PWM_BASE) & (1u << 1);
-
-		if (sp) {
-			const uint32_t v1 = pwmv2_get_capture_posedge_value(PWM_BASE, pwm_channel_1);
-			const uint32_t v0 = pwmv2_get_capture_posedge_value(PWM_BASE, pwm_channel_0);
-			pwmv2_clear_capture_posedge_irq_status(PWM_BASE, sp);
-			(void)v0;
-
-			if (npos < 64u) {
-				pos[npos++] = v1 ? v1 : v0;
-			}
-		}
-
-		const uint32_t sn = pwmv2_get_capture_negedge_irq_status(PWM_BASE) & (1u << 1);
-
-		if (sn) {
-			const uint32_t v1 = pwmv2_get_capture_negedge_value(PWM_BASE, pwm_channel_1);
-			const uint32_t v0 = pwmv2_get_capture_negedge_value(PWM_BASE, pwm_channel_0);
-			pwmv2_clear_capture_negedge_irq_status(PWM_BASE, sn);
-			(void)v0;
-
-			if (nneg < 64u) {
-				neg[nneg++] = v1 ? v1 : v0;
-			}
-		}
+	while (spin++ < 2000000u && up_dshot_tc_count() == 0) {
 	}
 
+	usleep(60);
+	up_dshot_capture_enable(false);
 	up_dshot_arm(false);
-
-	PX4_INFO("captest: %u kbit/s, throttle %u, edges pos %u neg %u",
-		 rate_kbit, (unsigned)throttle, npos, nneg);
-
-	const unsigned pairs = npos < nneg ? npos : nneg;
-	const uint32_t reload = clock_get_frequency(clock_pwm1) / (rate_kbit * 1000u) - 1;
-	const uint32_t threshold = reload / 2u;
 
 	const uint16_t packet = (uint16_t)((throttle << 1) & 0xFFFFu);
 	const uint16_t crc = (packet ^ (packet >> 4) ^ (packet >> 8)) & 0x0F;
 	const uint16_t sent = (uint16_t)((packet << 4) | crc);
+	const uint32_t reload = clock_get_frequency(clock_pwm1) / (rate_kbit * 1000u) - 1;
 
-	uint16_t received = 0;
-	unsigned decoded = 0;
+	unsigned bits_down = 0, pairs_down = 0, bits_up = 0, pairs_up = 0;
+	const uint16_t frame_down = cap_decode(reload, false, &bits_down, &pairs_down);
+	const bool ok_down = (bits_down == 16u) && (frame_down == sent);
+	const uint16_t frame_up = cap_decode(reload, true, &bits_up, &pairs_up);
+	const bool ok_up = (bits_up == 16u) && (frame_up == sent);
+	const bool ok = ok_down || ok_up;
 
-	for (unsigned i = 0; i < pairs && decoded < 16u; i++) {
-		/* Counter counts down: the high time is the distance pos -> neg. */
-		const uint32_t high = (pos[i] - neg[i]) & 0xFFFFFFu;
-		const bool bit = high > threshold;
+	if (verbose) {
+		PX4_INFO("captest: %u kbit/s (reload %u), throttle %u, frame 0x%04x",
+			 rate_kbit, (unsigned)reload, (unsigned)throttle, (unsigned)sent);
+		PX4_INFO("captest: edges %u (dropped %u), down %u bits 0x%04x, up %u bits 0x%04x",
+			 (unsigned)up_dshot_capture_count(), (unsigned)up_dshot_capture_dropped(),
+			 bits_down, (unsigned)frame_down, bits_up, (unsigned)frame_up);
 
-		received = (uint16_t)((received << 1) | (bit ? 1u : 0u));
-		decoded++;
-
-		PX4_INFO("captest: %u pos %u neg %u high %u bit %d", i, (unsigned)pos[i],
-			 (unsigned)neg[i], (unsigned)high, bit ? 1 : 0);
+		for (uint32_t i = 0; i < up_dshot_capture_count() && i < 8u; i++) {
+			uint32_t value = 0;
+			uint8_t channel = 0;
+			bool posedge = false;
+			up_dshot_capture_get(i, &value, &channel, &posedge);
+			PX4_INFO("captest: [%u] ch %u %s %u", (unsigned)i, (unsigned)channel,
+				 posedge ? "pos" : "neg", (unsigned)value);
+		}
 	}
 
-	if (decoded == 16u) {
-		PX4_INFO("captest: sent 0x%04x received 0x%04x %s", (unsigned)sent, (unsigned)received,
-			 sent == received ? "MATCH" : "MISMATCH");
+	PX4_INFO("captest: %u kbit/s throttle %3u%% -> %s", rate_kbit, throttle_percent,
+		 ok ? "MATCH" : "MISMATCH");
 
-	} else {
-		PX4_INFO("captest: only %u bits decoded, sent 0x%04x", decoded, (unsigned)sent);
+	return ok ? 0 : 1;
+}
+
+static int captest_run(unsigned rate_kbit, unsigned throttle_percent, int cap_sel)
+{
+	(void)cap_sel;
+	return cap_send_and_check(rate_kbit, throttle_percent, true);
+}
+
+static int capscan_run(void)
+{
+	static const unsigned rates[] = {150u, 300u, 600u};
+	static const unsigned throttles[] = {0u, 25u, 50u, 75u, 100u};
+
+	unsigned pass = 0, fail = 0;
+
+	for (unsigned r = 0; r < sizeof(rates) / sizeof(rates[0]); r++) {
+		for (unsigned t = 0; t < sizeof(throttles) / sizeof(throttles[0]); t++) {
+			const int ret = cap_send_and_check(rates[r], throttles[t], false);
+
+			if (ret == 0) {
+				pass++;
+
+			} else if (ret > 0) {
+				fail++;
+			}
+		}
 	}
 
-	PX4_INFO("captest: frame sent 0x%04x, sel %d", (unsigned)((throttle << 1) & 0xFFFFu), cap_sel);
-	PX4_INFO("captest raw: POS0 0x%08x POS1 0x%08x POS2 0x%08x",
-		 (unsigned)PWM_BASE->CAPTURE_POS[0], (unsigned)PWM_BASE->CAPTURE_POS[1],
-		 (unsigned)PWM_BASE->CAPTURE_POS[2]);
-	PX4_INFO("captest raw: NEG0 0x%08x NEG1 0x%08x", (unsigned)PWM_BASE->CAPTURE_NEG[0], (unsigned)PWM_BASE->CAPTURE_NEG[1]);
-	PX4_INFO("captest raw: STS_POS 0x%08x STS_NEG 0x%08x CNT0 %u CNT1 %u",
-		 (unsigned)PWM_BASE->IRQ_STS_CAP_POS, (unsigned)PWM_BASE->IRQ_STS_CAP_NEG,
-		 (unsigned)PWM_BASE->CNT_VAL[0], (unsigned)PWM_BASE->CNT_VAL[1]);
+	PX4_INFO("capscan: %u passed, %u failed", pass, fail);
 
-	up_dshot_deinit();
-
-	return (npos || nneg) ? 0 : 1;
+	return fail == 0 ? 0 : 1;
 }
 extern "C" int pwmv2test_main(int argc, char *argv[])
 {
@@ -684,6 +739,10 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 	unsigned dshot_rate = 600;
 	unsigned dshot_throttle = 0;
 	unsigned dshot_frames = 3000;   /* duration, ms */
+
+	if (argc > 1 && strcmp(argv[1], "capscan") == 0) {
+		return capscan_run();
+	}
 
 	if (argc > 1 && strcmp(argv[1], "captest") == 0) {
 		unsigned rate = 600;

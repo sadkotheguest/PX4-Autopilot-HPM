@@ -224,3 +224,32 @@ UM reference: `PWM_CFG1.HIGHZ_EN_N` (bit 28) - "0 to highz pwm outputs
 (pad_oe*=0), software need set this bit to 1 to enable pwm output".  The fault
 path can also tri-state the pin (`FAULT_MODE = 2'b1x` -> output high-Z), which is
 reserved for fault handling, not for the DShot reply window.
+### ISR capture: current state (ring buffer works, latch values frozen)
+
+Implemented `up_dshot_capture_init/enable/reset/count/get` in `dshot.c`:
+PWM1 IRQ attached, one ring-buffer entry per captured edge (channel, edge
+kind, counter value), 128 entries, dropped counter.
+
+Result of `pwmv2test captest 600 50` (jumper PE08->PE09):
+
+    edges 28 (dropped 0)
+    [0] ch1 pos 90   [1] ch1 pos 90   [2] ch1 neg 7   [3] ch1 pos 90 ...
+
+The ISR runs and the ring buffer fills, but every captured value is the same
+pair (pos 90, neg 7, difference 83 = the comparator value of a "1" bit), i.e.
+the `CAPTURE_POS/NEG[1]` registers are not being updated per edge - they keep
+a value latched once.  The status bits still get set (so the capture module
+detects edges), but the snapshot does not change.
+
+Hypotheses to test next:
+
+1. `CNT_INDEX` selects the counter, but the counter must be the one that
+   actually runs while capturing; try each of the 4 counters and log
+   `CAPTURE_POS/CNT_INDEX` bits after writing.
+2. Read the raw 32-bit `CAPTURE_POS[1]` inside the ISR (including SELGPIO and
+   CNT_INDEX bits) to verify the configuration is still what we wrote.
+3. Capture a slow, known signal instead of a 1.6 us DShot bit: e.g. drive
+   PE09 from another PWM channel at 1 kHz / 50 % and check that pos/neg values
+   change with the period (this separates "latch works" from "too fast").
+4. Check whether the capture input for channel 1 needs the channel output
+   enabled (the pad is in PWM1_P_1 with the channel output in high-Z).
