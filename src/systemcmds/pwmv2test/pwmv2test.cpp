@@ -2136,6 +2136,45 @@ static int cmpdma_run(unsigned out_enable, unsigned cmp_index)
 
 	return (nz > 0u) ? 0 : 1;
 }
+/* ------------------------------------------------------------------------ */
+/* Dump the PWMv2 register state after arming a DShot frame.                */
+/* ------------------------------------------------------------------------ */
+
+static int pwmregs_run(unsigned rate_kbit)
+{
+	up_dshot_deinit();
+
+	if (up_dshot_init(0x1, rate_kbit * 1000u, false) != OK) {
+		PX4_ERR("pwmregs: dshot init failed");
+		return 1;
+	}
+
+	dshot_motor_data_set(0, 1048u, false);
+	up_dshot_arm(true);
+	usleep(1000);
+
+	PX4_INFO("pwmregs: WORK_CTRL0 0x%08x WORK_CTRL1 0x%08x",
+		 (unsigned)PWM_BASE->WORK_CTRL0, (unsigned)PWM_BASE->WORK_CTRL1);
+
+	for (unsigned i = 0; i < 4u; i++) {
+		const uint32_t cfg = PWM_BASE->CMP[i].CFG;
+		PX4_INFO("pwmregs: CMP[%u].CFG 0x%08x update_time %u trig_sel %u",
+			 i, (unsigned)cfg,
+			 (unsigned)((cfg >> 24) & 0x7u),
+			 (unsigned)((cfg >> 28) & 0x7u));
+	}
+
+	PX4_INFO("pwmregs: CNT[0].CFG0 0x%08x CFG1 0x%08x CFG2 0x%08x",
+		 (unsigned)PWM_BASE->CNT[0].CFG0, (unsigned)PWM_BASE->CNT[0].CFG1,
+		 (unsigned)PWM_BASE->CNT[0].CFG2);
+
+	for (unsigned i = 0; i < 4u; i++) {
+		PX4_INFO("pwmregs: SHADOW[%u] 0x%08x", i, (unsigned)PWM_BASE->SHADOW_VAL[i]);
+	}
+
+	up_dshot_arm(false);
+	return 0;
+}
 extern "C" int pwmv2test_main(int argc, char *argv[])
 {
 	uint32_t frequency = 1000;
@@ -2150,6 +2189,10 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 	unsigned dshot_rate = 600;
 	unsigned dshot_throttle = 0;
 	unsigned dshot_frames = 3000;   /* duration, ms */
+
+	if (argc > 1 && strcmp(argv[1], "pwmregs") == 0) {
+		return pwmregs_run(argc > 2 ? strtoul(argv[2], nullptr, 0) : 150u);
+	}
 
 	if (argc > 1 && strcmp(argv[1], "cmpdma") == 0) {
 		const unsigned out_en = (argc > 2) ? strtoul(argv[2], nullptr, 0) : 0u;

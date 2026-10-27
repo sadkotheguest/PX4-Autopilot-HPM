@@ -421,6 +421,12 @@ void up_dshot_trigger(void)
 				     dshot_cmp((channel_frame[ch] >> 15) & 1), 0, false);
 	}
 
+	/* Enable the shadow lock so the duty shadows written by the DMA are applied
+	 * on the comparator update trigger (reload) instead of immediately; without
+	 * it a mid-period write makes the comparator match twice.
+	 */
+	pwmv2_shadow_register_lock(pwm);
+
 	pwmv2_shadow_register_lock(pwm);
 
 	/* Re-arm the descriptor chain from its first node. */
