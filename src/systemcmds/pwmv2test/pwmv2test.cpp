@@ -2244,8 +2244,15 @@ static int gcapm_run(unsigned rate_kbit, unsigned throttle_percent)
 	const uint32_t *buf = up_dshot_rxg_buffer(1u);
 	const unsigned words = up_dshot_rxg_words();
 
-	PX4_INFO("gcapm: %u kbit/s (bit %u ticks), thr %u, sent 0x%04x",
-		 rate_kbit, (unsigned)bit_ticks, (unsigned)throttle, (unsigned)sent);
+	PX4_INFO("gcapm: %u kbit/s (bit %u ticks), thr %u, sent 0x%04x, ready %d, tx_tc %u",
+		 rate_kbit, (unsigned)bit_ticks, (unsigned)throttle, (unsigned)sent,
+		 up_dshot_rxg_ready() ? 1 : 0, (unsigned)up_dshot_tc_count());
+
+	{
+		PX4_INFO("gcapm: raw f0..f5 = %u %u %u %u %u %u",
+			 (unsigned)buf[0], (unsigned)buf[1], (unsigned)buf[2],
+			 (unsigned)buf[3], (unsigned)buf[4], (unsigned)buf[5]);
+	}
 
 	unsigned shown = 0;
 
@@ -2264,6 +2271,162 @@ static int gcapm_run(unsigned rate_kbit, unsigned throttle_percent)
 
 	return 0;
 }
+/* ------------------------------------------------------------------------ */
+/* Continuous measure-mode receive: several frames, decode each with CRC.    */
+/* ------------------------------------------------------------------------ */
+
+static bool dshot_frame_crc_ok(uint16_t frame)
+{
+	const uint16_t packet = frame >> 4;
+	const uint16_t crc = (packet ^ (packet >> 4) ^ (packet >> 8)) & 0x0F;
+
+	return (frame & 0x0F) == crc;
+}
+
+/* Find a run of plausible widths and rebuild the frame from it.  A run of 15
+ * widths lacks the last bit (measure mode reports the previous pulse), so both
+ * candidates are checked against the frame CRC.
+ */
+static bool gcapm_scan(const uint32_t *buf, unsigned words, uint32_t half,
+		       uint16_t *found, unsigned *offset)
+{
+	const uint32_t lo = half / 2u;
+	const uint32_t hi = half * 3u / 2u;
+	unsigned run_start = 0, run_len = 0;
+
+	for (unsigned i = 0; i <= words; i++) {
+		const bool ok = (i < words) && (buf[i] >= lo) && (buf[i] <= hi);
+
+		if (ok) {
+			if (run_len == 0u) {
+				run_start = i;
+			}
+
+			run_len++;
+
+		} else {
+			if (run_len >= 15u) {
+				break;
+			}
+
+			run_len = 0;
+		}
+	}
+
+	if (run_len < 15u) {
+		return false;
+	}
+
+	uint16_t base = 0;
+
+	for (unsigned i = 0; i < 15u; i++) {
+		base = (uint16_t)((base << 1) | ((buf[run_start + i] > half) ? 1u : 0u));
+	}
+
+	if (run_len >= 16u) {
+		uint16_t frame = 0;
+
+		for (unsigned i = 0; i < 16u; i++) {
+			frame = (uint16_t)((frame << 1) | ((buf[run_start + i] > half) ? 1u : 0u));
+		}
+
+		if (dshot_frame_crc_ok(frame)) {
+			*found = frame;
+			*offset = run_start;
+			return true;
+		}
+	}
+
+	for (unsigned bit = 0; bit < 2u; bit++) {
+		const uint16_t frame = (uint16_t)((base << 1) | bit);
+
+		if (dshot_frame_crc_ok(frame)) {
+			*found = frame;
+			*offset = run_start;
+			return true;
+		}
+	}
+
+	return false;
+}
+static int gcapmseq_run(unsigned rate_kbit)
+{
+	if (rate_kbit < 20 || rate_kbit > 1200) {
+		PX4_ERR("usage: pwmv2test gcapmseq <rate_kbit>");
+		return 1;
+	}
+
+	up_dshot_rxg_deinit();
+	up_dshot_deinit();
+
+	if (up_dshot_init(0x1, rate_kbit * 1000u, false) != OK) {
+		PX4_ERR("gcapmseq: dshot init failed");
+		return 1;
+	}
+
+	if (up_dshot_rxg_init(0x2) != OK) {
+		PX4_ERR("gcapmseq: capture init failed");
+		return 1;
+	}
+
+	const uint32_t gclk = clock_get_frequency(clock_gptmr0);
+	const uint32_t half = gclk / (rate_kbit * 1000u) / 2u;
+	static const unsigned throttles[] = {0u, 10u, 25u, 50u, 75u, 90u, 100u};
+	unsigned pass = 0, fail = 0;
+
+	up_dshot_arm(true);
+	usleep(50);
+
+	for (unsigned k = 0; k < sizeof(throttles) / sizeof(throttles[0]); k++) {
+		uint32_t thr = 48u + throttles[k] * 2000u / 100u;
+
+		if (thr > 2047u) {
+			thr = 2047u;
+		}
+
+		const uint16_t packet = (uint16_t)((thr << 1) & 0xFFFFu);
+		const uint16_t crc = (packet ^ (packet >> 4) ^ (packet >> 8)) & 0x0F;
+		const uint16_t sent = (uint16_t)((packet << 4) | crc);
+
+		dshot_motor_data_set(0, (uint16_t)thr, false);
+		up_dshot_tc_reset();
+		up_dshot_rxg_start();
+		usleep(50);
+		up_dshot_trigger();
+
+		uint32_t spin = 0;
+
+		while (spin++ < 2000000u && up_dshot_tc_count() == 0) {
+		}
+
+		usleep(200);
+		up_dshot_rxg_stop();
+
+		const uint32_t *buf = up_dshot_rxg_buffer(1u);
+		const unsigned words = up_dshot_rxg_words();
+		uint16_t found = 0;
+		unsigned offset = 0;
+		const bool ok = (buf != nullptr) && gcapm_scan(buf, words, half, &found, &offset);
+		const bool match = ok && ((found >> 1) == (sent >> 1));
+
+		PX4_INFO("gcapmseq: %3u%% thr %4u sent 0x%04x found 0x%04x off %2u %s",
+			 throttles[k], (unsigned)thr, (unsigned)sent, (unsigned)found, offset,
+			 match ? "MATCH" : "MISMATCH");
+
+		if (match) {
+			pass++;
+
+		} else {
+			fail++;
+		}
+	}
+
+	up_dshot_arm(false);
+
+	PX4_INFO("gcapmseq: %u passed, %u failed", pass, fail);
+
+	return (fail == 0) ? 0 : 1;
+}
 extern "C" int pwmv2test_main(int argc, char *argv[])
 {
 	uint32_t frequency = 1000;
@@ -2278,6 +2441,10 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 	unsigned dshot_rate = 600;
 	unsigned dshot_throttle = 0;
 	unsigned dshot_frames = 3000;   /* duration, ms */
+
+	if (argc > 1 && strcmp(argv[1], "gcapmseq") == 0) {
+		return gcapmseq_run(argc > 2 ? strtoul(argv[2], nullptr, 0) : 600u);
+	}
 
 	if (argc > 1 && strcmp(argv[1], "gcapm") == 0) {
 		unsigned rate = 600;

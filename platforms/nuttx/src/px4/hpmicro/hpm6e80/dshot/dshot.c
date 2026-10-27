@@ -701,7 +701,7 @@ bool up_dshot_capture_get(uint32_t index, uint32_t *value, uint8_t *channel, boo
  * whole GPIO port.
  */
 
-#define DSHOT_RXG_CHANNELS  2u
+#define DSHOT_RXG_CHANNELS  4u
 #define DSHOT_RXG_EVENTS    48u            /* captured pulse widths per window */
 #define DSHOT_RXG_WORDS     (DSHOT_RXG_EVENTS)
 
@@ -715,6 +715,8 @@ typedef struct {
 static const dshot_rxg_map_t rxg_map[DSHOT_RXG_CHANNELS] = {
 	{ HPM_GPTMR0, 2u, HPM_TRGM0_OUTPUT_SRC_GPTMR0_IN2, HPM_DMA_SRC_GPTMR0_2 },
 	{ HPM_GPTMR0, 3u, HPM_TRGM0_OUTPUT_SRC_GPTMR0_IN3, HPM_DMA_SRC_GPTMR0_3 },
+	{ HPM_GPTMR1, 2u, HPM_TRGM0_OUTPUT_SRC_GPTMR1_IN2, HPM_DMA_SRC_GPTMR1_2 },
+	{ HPM_GPTMR1, 3u, HPM_TRGM0_OUTPUT_SRC_GPTMR1_IN3, HPM_DMA_SRC_GPTMR1_3 },
 };
 
 static uint32_t rxg_buf[DSHOT_RXG_CHANNELS][DSHOT_RXG_WORDS]
@@ -757,6 +759,7 @@ int up_dshot_rxg_init(uint32_t channel_mask)
 	rxg_count = DSHOT_RXG_CHANNELS;
 
 	clock_add_to_group(clock_gptmr0, 0);
+	clock_add_to_group(clock_gptmr1, 0);
 
 	for (unsigned idx = 0; idx < rxg_count; idx++) {
 		if ((rxg_mask & (1u << idx)) == 0) {
@@ -857,10 +860,12 @@ void up_dshot_rxg_start(void)
 		dma_clear_transfer_status(rxg_res[idx].base, rxg_res[idx].channel);
 
 		if (dma_mgr_setup_channel(&rxg_res[idx], &rxg_conf[idx]) != status_success) {
+			PX4_ERR("rxg: setup failed for channel %u", idx);
 			continue;
 		}
 
 		if (dma_mgr_enable_channel(&rxg_res[idx]) != status_success) {
+			PX4_ERR("rxg: enable failed for channel %u", idx);
 			continue;
 		}
 
