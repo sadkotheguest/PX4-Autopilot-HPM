@@ -543,6 +543,103 @@ static int dmadiag_run(uint32_t clock, unsigned freq_hz, unsigned words, const c
 
 	return tc ? 0 : 1;
 }
+/* ------------------------------------------------------------------------ */
+/* Capture self-test: PE08 sends a DShot frame, PE09 (jumper) captures it.   */
+/* ------------------------------------------------------------------------ */
+
+static int captest_run(unsigned rate_kbit, unsigned throttle_percent)
+{
+	if (rate_kbit != 150 && rate_kbit != 300 && rate_kbit != 600) {
+		PX4_ERR("usage: pwmv2test captest [150|300|600] [throttle_pct]");
+		return 1;
+	}
+
+	up_dshot_set_buffer_region(0);
+
+	if (up_dshot_init(0x1, rate_kbit * 1000u, false) != OK) {
+		PX4_ERR("captest: dshot init failed");
+		return 1;
+	}
+
+	/* PE09 as GPIO input with pull-down, capture from the pad. */
+	HPM_IOC->PAD[IOC_PAD_PE09].FUNC_CTL = 0;
+	HPM_IOC->PAD[IOC_PAD_PE09].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
+
+	pwmv2_capture_selection_input_source(PWM_BASE, pwm_channel_1, pwm_capture_from_gpio);
+	pwmv2_set_capture_counter_index(PWM_BASE, pwm_channel_1, 0);
+
+	pwmv2_cmp_config_t cfg = {};
+	cfg.mode = 1;                                  /* input capture */
+	cfg.cmp_source = cmp_value_from_capture_posedge;
+	pwmv2_config_cmp(PWM_BASE, 2, &cfg);
+
+	pwmv2_clear_capture_posedge_irq_status(PWM_BASE, 0xFFFFFFFFu);
+	pwmv2_clear_capture_negedge_irq_status(PWM_BASE, 0xFFFFFFFFu);
+
+	uint32_t throttle = 48u + throttle_percent * 2000u / 100u;
+
+	if (throttle > 2047u) {
+		throttle = 2047u;
+	}
+
+	dshot_motor_data_set(0, (uint16_t)throttle, false);
+	up_dshot_arm(true);
+	up_dshot_tc_reset();
+	up_dshot_trigger();
+
+	uint32_t pos[64];
+	uint32_t neg[64];
+	unsigned npos = 0, nneg = 0;
+
+	for (unsigned i = 0; i < 400000u && npos < 20u && nneg < 20u; i++) {
+		const uint32_t sp = pwmv2_get_capture_posedge_irq_status(PWM_BASE);
+
+		if (sp) {
+			const uint32_t v1 = pwmv2_get_capture_posedge_value(PWM_BASE, pwm_channel_1);
+			const uint32_t v0 = pwmv2_get_capture_posedge_value(PWM_BASE, pwm_channel_0);
+			pwmv2_clear_capture_posedge_irq_status(PWM_BASE, sp);
+			(void)v0;
+
+			if (npos < 64u) {
+				pos[npos++] = v1 ? v1 : v0;
+			}
+		}
+
+		const uint32_t sn = pwmv2_get_capture_negedge_irq_status(PWM_BASE);
+
+		if (sn) {
+			const uint32_t v1 = pwmv2_get_capture_negedge_value(PWM_BASE, pwm_channel_1);
+			const uint32_t v0 = pwmv2_get_capture_negedge_value(PWM_BASE, pwm_channel_0);
+			pwmv2_clear_capture_negedge_irq_status(PWM_BASE, sn);
+			(void)v0;
+
+			if (nneg < 64u) {
+				neg[nneg++] = v1 ? v1 : v0;
+			}
+		}
+	}
+
+	up_dshot_arm(false);
+
+	PX4_INFO("captest: %u kbit/s, throttle %u, edges pos %u neg %u",
+		 rate_kbit, (unsigned)throttle, npos, nneg);
+
+	const unsigned pairs = npos < nneg ? npos : nneg;
+	uint16_t bits = 0;
+	unsigned decoded = 0;
+
+	for (unsigned i = 0; i < pairs && decoded < 16u; i++) {
+		/* The counter counts down from the period. */
+		const uint32_t high = pos[i] > neg[i] ? pos[i] - neg[i] : 0;
+		PX4_INFO("captest: %u pos %u neg %u high %u", i, (unsigned)pos[i], (unsigned)neg[i], (unsigned)high);
+	}
+
+	PX4_INFO("captest: frame sent 0x%04x", (unsigned)((throttle << 1) & 0xFFFFu));
+
+	up_dshot_deinit();
+
+	return (npos || nneg) ? 0 : 1;
+}
 extern "C" int pwmv2test_main(int argc, char *argv[])
 {
 	uint32_t frequency = 1000;
@@ -557,6 +654,21 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 	unsigned dshot_rate = 600;
 	unsigned dshot_throttle = 0;
 	unsigned dshot_frames = 3000;   /* duration, ms */
+
+	if (argc > 1 && strcmp(argv[1], "captest") == 0) {
+		unsigned rate = 600;
+		unsigned thr = 50;
+
+		if (argc > 2) {
+			rate = strtoul(argv[2], nullptr, 0);
+		}
+
+		if (argc > 3) {
+			thr = strtoul(argv[3], nullptr, 0);
+		}
+
+		return captest_run(rate, thr);
+	}
 
 	if (argc > 1 && strcmp(argv[1], "dmadiag") == 0) {
 		dmadiag = true;

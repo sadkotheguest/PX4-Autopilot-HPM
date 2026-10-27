@@ -118,3 +118,32 @@ Trade-offs:
   200 MHz; the reply period is ~1 us..20 us, so no overflow).
 - Whether the pad must be open-drain during the reply (depends on the ESC
   driver strength).
+
+## Capture bring-up log (self-test, jumper PE08 -> PE09)
+
+First attempt, `pwmv2test captest <rate> <throttle>` in pwmv2test:
+
+- PE08 stays the DShot output (channel 0), PE09 is configured as GPIO input
+  with a pull-down and `pwmv2_capture_selection_input_source(..., pwm_channel_1,
+  pwm_capture_from_gpio)`;
+- comparator 2 was put into input-capture mode with
+  `cmp_source = cmp_value_from_capture_posedge`, capture counter index 0;
+- the status registers do report edges (~20 rising / 20 falling for one
+  frame), so the pad input path and the capture event logic work;
+- but `pwmv2_get_capture_posedge_value()/negedge_value()` return 0xFFFFFF
+  (the "no capture" value), i.e. the counter snapshot is not associated with
+  the capture register.
+
+Next experiments:
+
+1. Use the comparator index that belongs to the capture channel (channel 1 ->
+   comparator 1) instead of comparator 2 - the SDK pwm_cap sample passes the
+   *channel* to `pwm_config_cmp()`, not an arbitrary comparator.
+2. Check whether the capture counter has to be put into a capture counter type
+   (the v1 sample uses `pwm_counter_type_capture_falling_edge`); look for the
+   PWMv2 equivalent.
+3. Try reading both `CAPTURE_POS` and `CAPTURE_NEG` for every channel and log
+   which index actually holds the snapshot.
+4. Only after the snapshot works: replace polling by the capture DMA request
+   (`pwmv2_enable_dma_at_compare_point`) and decode the DShot frame from the
+   captured edges (compare with `channel_frame[0]`), then add GCR decoding.
