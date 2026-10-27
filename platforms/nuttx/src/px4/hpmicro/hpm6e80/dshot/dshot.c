@@ -239,7 +239,7 @@ static void dshot_pwm_init(void)
 	cmp_trig.cmp_source = cmp_value_from_shadow_val;
 	cmp_trig.cmp_source_index = sh_dma_trig;
 	cmp_trig.update_trigger = pwm_shadow_register_update_on_reload;
-	pwmv2_config_cmp(pwm, 8u, &cmp_trig);
+	pwmv2_config_cmp(pwm, 2u, &cmp_trig);
 
 	pwmv2_counter_select_data_offset_from_shadow_value(pwm, counter, sh_period);
 	pwmv2_counter_burst_disable(pwm, counter);
@@ -270,7 +270,7 @@ static void dshot_build_descriptors(void)
 
 static int dshot_dma_init(void)
 {
-	trgm_dma_request_config(HPM_TRGM0, TRGM_DMACFG_0, HPM_TRGM0_DMA_SRC_PWM1_REQ0);
+	trgm_dma_request_config(HPM_TRGM0, TRGM_DMACFG_1, HPM_TRGM0_DMA_SRC_PWM1_REQ1);
 
 	dma_mgr_init();
 
@@ -282,7 +282,7 @@ static int dshot_dma_init(void)
 
 	dma_mgr_get_default_chn_config(&dma_conf);
 	dma_conf.en_dmamux = true;
-	dma_conf.dmamux_src = HPM_DMA_SRC_MOT_0;
+	dma_conf.dmamux_src = HPM_DMA_SRC_MOT_1;
 	dma_conf.src_mode = 0;
 	dma_conf.dst_mode = 1;                    /* one request -> one burst */
 	dma_conf.src_width = DMA_TRANSFER_WIDTH_WORD;
@@ -311,7 +311,7 @@ static int dshot_dma_init(void)
 	}
 
 	/* The request stays enabled; it only fires while the counter runs. */
-	pwmv2_enable_dma_at_reload_point(pwm, dma_chn, counter);
+	pwmv2_enable_dma_at_compare_point(pwm, pwm_dma_1, 2u);
 
 	return OK;
 }

@@ -2013,6 +2013,131 @@ static int gcapd_run(unsigned rate_kbit, unsigned throttle_percent, bool chain)
 
 	return (bits == 16u && frame == sent) ? 0 : 1;
 }
+/* ------------------------------------------------------------------------ */
+/* Isolated compare-point DMA test: cmp0 matches -> DMA copies the counter.  */
+/* ------------------------------------------------------------------------ */
+
+static uint32_t cmpdma_buf[32] __attribute__((section(".ahb_sram")));
+static volatile uint32_t cmpdma_tc;
+
+static void cmpdma_tc_cb(DMA_Type *base, uint32_t channel, void *cb_data)
+{
+	(void)base;
+	(void)channel;
+	(void)cb_data;
+	cmpdma_tc++;
+}
+
+static int cmpdma_run(unsigned out_enable, unsigned cmp_index)
+{
+	clock_add_to_group(clock_pwm1, 0);
+	clock_add_to_group(clock_hdma, 0);
+
+	const uint32_t reload = 1000u;   /* 200 MHz / 1000 = 200 kHz */
+
+	pwmv2_deinit(PWM_BASE);
+	pwmv2_shadow_register_unlock(PWM_BASE);
+	pwmv2_set_shadow_val(PWM_BASE, PWMV2_SHADOW_INDEX(0), reload, 0, false);
+	pwmv2_set_shadow_val(PWM_BASE, PWMV2_SHADOW_INDEX(1), reload / 2u, 0, false);
+	pwmv2_counter_select_data_offset_from_shadow_value(PWM_BASE, pwm_counter_0, PWMV2_SHADOW_INDEX(0));
+	pwmv2_counter_burst_disable(PWM_BASE, pwm_counter_0);
+	pwmv2_set_reload_update_time(PWM_BASE, pwm_counter_0, pwm_reload_update_on_shlk);
+
+	pwmv2_cmp_config_t cmp = {};
+	cmp.cmp = reload / 2u;
+	cmp.cmp_source = cmp_value_from_shadow_val;
+	cmp.cmp_source_index = PWMV2_SHADOW_INDEX(1);
+	cmp.update_trigger = pwm_shadow_register_update_on_reload;
+	pwmv2_config_cmp(PWM_BASE, (uint8_t)cmp_index, &cmp);
+
+	pwmv2_shadow_register_lock(PWM_BASE);
+	pwmv2_issue_shadow_register_lock_event(PWM_BASE);
+
+	HPM_IOC->PAD[IOC_PAD_PE08].FUNC_CTL = IOC_PE08_FUNC_CTL_PWM1_P_0;
+	HPM_IOC->PAD[IOC_PAD_PE08].PAD_CTL = IOC_PAD_PAD_CTL_DS_SET(7) | IOC_PAD_PAD_CTL_SPD_SET(2);
+	pwmv2_disable_four_cmp(PWM_BASE, pwm_channel_0);
+
+	if (out_enable) {
+		pwmv2_channel_enable_output(PWM_BASE, pwm_channel_0);
+	}
+
+	memset(cmpdma_buf, 0, sizeof(cmpdma_buf));
+
+	trgm_dma_request_config(HPM_TRGM0, TRGM_DMACFG_1, HPM_TRGM0_DMA_SRC_PWM1_REQ1);
+
+	dma_mgr_init();
+
+	dma_resource_t res;
+
+	if (dma_mgr_request_resource(&res) != status_success) {
+		PX4_ERR("cmpdma: no dma resource");
+		return 1;
+	}
+
+	dma_mgr_chn_conf_t conf;
+	dma_mgr_get_default_chn_config(&conf);
+	conf.en_dmamux = true;
+	conf.dmamux_src = HPM_DMA_SRC_MOT_1;
+	conf.src_mode = 1;
+	conf.dst_mode = 0;
+	conf.src_width = DMA_TRANSFER_WIDTH_WORD;
+	conf.dst_width = DMA_TRANSFER_WIDTH_WORD;
+	conf.src_addr_ctrl = 2;                  /* fixed: the counter */
+	conf.dst_addr_ctrl = 0;
+	conf.src_burst_size = DMA_NUM_TRANSFER_PER_BURST_1T;
+	conf.src_addr = (uint32_t)&PWM_BASE->CNT_VAL[0];
+	conf.dst_addr = (uint32_t)cmpdma_buf;
+	conf.size_in_byte = sizeof(cmpdma_buf);
+	conf.en_infiniteloop = false;
+	conf.handshake_opt = DMA_HANDSHAKE_OPT_ONE_BURST;
+	conf.interrupt_mask = DMA_INTERRUPT_MASK_ALL & ~DMA_INTERRUPT_MASK_TERMINAL_COUNT;
+
+	if (dma_mgr_setup_channel(&res, &conf) != status_success) {
+		PX4_ERR("cmpdma: setup failed");
+		return 1;
+	}
+
+	dma_mgr_install_chn_tc_callback(&res, cmpdma_tc_cb, NULL);
+
+	pwmv2_enable_dma_at_compare_point(PWM_BASE, pwm_dma_1, (uint8_t)cmp_index);
+	const uint32_t dma_en = PWM_BASE->DMA_EN;
+
+	cmpdma_tc = 0;
+	dma_clear_transfer_status(res.base, res.channel);
+
+	if (dma_mgr_enable_channel(&res) != status_success) {
+		PX4_ERR("cmpdma: enable failed");
+	}
+
+	pwmv2_reset_counter(PWM_BASE, pwm_counter_0);
+	pwmv2_enable_counter(PWM_BASE, pwm_counter_0);
+	pwmv2_start_pwm_output(PWM_BASE, pwm_counter_0);
+
+	uint32_t spin = 0;
+
+	while (spin++ < 2000000u && cmpdma_tc == 0u) {
+	}
+
+	pwmv2_disable_counter(PWM_BASE, pwm_counter_0);
+	pwmv2_disable_dma_at_compare_point(PWM_BASE, pwm_dma_1);
+	dma_mgr_disable_channel(&res);
+	dma_mgr_release_resource(&res);
+
+	unsigned nz = 0;
+
+	for (unsigned i = 0; i < 32u; i++) {
+		if (cmpdma_buf[i] != 0u) {
+			nz++;
+		}
+	}
+
+	PX4_INFO("cmpdma: cmp %u out_enable %u, DMA_EN 0x%08x, tc %u, non-zero %u/32, buf %u %u %u %u",
+		 cmp_index, out_enable, (unsigned)dma_en, (unsigned)cmpdma_tc, nz,
+		 (unsigned)cmpdma_buf[0], (unsigned)cmpdma_buf[1],
+		 (unsigned)cmpdma_buf[2], (unsigned)cmpdma_buf[3]);
+
+	return (nz > 0u) ? 0 : 1;
+}
 extern "C" int pwmv2test_main(int argc, char *argv[])
 {
 	uint32_t frequency = 1000;
@@ -2027,6 +2152,13 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 	unsigned dshot_rate = 600;
 	unsigned dshot_throttle = 0;
 	unsigned dshot_frames = 3000;   /* duration, ms */
+
+	if (argc > 1 && strcmp(argv[1], "cmpdma") == 0) {
+		const unsigned out_en = (argc > 2) ? strtoul(argv[2], nullptr, 0) : 0u;
+		const unsigned cmpidx = (argc > 3) ? strtoul(argv[3], nullptr, 0) : 0u;
+
+		return cmpdma_run(out_en, cmpidx);
+	}
 
 	if (argc > 1 && strcmp(argv[1], "gcapd") == 0) {
 		unsigned rate = 600;
