@@ -1665,12 +1665,21 @@ void up_dshot_rxf_start(void)
 	dma_clear_transfer_status(rxf_res.base, rxf_res.channel);
 
 	if (dma_mgr_setup_channel(&rxf_res, &rxf_conf) != status_success) {
+		PX4_ERR("rxf: setup failed (ch %u)", (unsigned)rxf_res.channel);
 		return;
 	}
 
 	rxf_res.base->CHCTRL[rxf_res.channel].CTRL |= DMAV2_CHCTRL_CTRL_SRC_FIXBURST_MASK;
 
-	dma_mgr_enable_channel(&rxf_res);
+	if (dma_mgr_enable_channel(&rxf_res) != status_success) {
+		PX4_ERR("rxf: enable failed (ch %u)", (unsigned)rxf_res.channel);
+		return;
+	}
+
+	PX4_DEBUG("rxf: armed ch %u CHEN 0x%08x CTRL 0x%08x", (unsigned)rxf_res.channel,
+		  (unsigned)rxf_res.base->CHEN,
+		  (unsigned)rxf_res.base->CHCTRL[rxf_res.channel].CTRL);
+
 	gptmr_start_counter(HPM_GPTMR0, DSHOT_RXF_CHANNEL);
 }
 

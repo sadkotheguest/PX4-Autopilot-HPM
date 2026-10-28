@@ -2536,6 +2536,8 @@ extern "C" const uint32_t *up_dshot_rxf_buffer(void);
 extern "C" unsigned up_dshot_rxf_words(void);
 extern "C" void up_dshot_rxf_deinit(void);
 
+static bool gcapf_quiet;
+
 static int gcapf_run(unsigned rate_kbit, unsigned throttle_percent)
 {
 	up_dshot_rxf_deinit();
@@ -2656,11 +2658,50 @@ static int gcapf_run(unsigned rate_kbit, unsigned throttle_percent)
 		}
 	}
 
-	PX4_INFO("gcapf: %u kbit/s, thr %u, sent 0x%04x recv 0x%04x (%u bits, %u edges, %u pairs) -> %s",
-		 rate_kbit, (unsigned)throttle, (unsigned)sent, (unsigned)frame, bits, edges, pairs,
-		 (bits == 16u && frame == sent) ? "MATCH" : "MISMATCH");
+	if (!gcapf_quiet) {
+		PX4_INFO("gcapf: %u kbit/s, thr %u, sent 0x%04x recv 0x%04x (%u bits, %u edges, %u pairs) -> %s",
+			 rate_kbit, (unsigned)throttle, (unsigned)sent, (unsigned)frame, bits, edges, pairs,
+			 (bits == 16u && frame == sent) ? "MATCH" : "MISMATCH");
+	}
 
 	return (bits == 16u && frame == sent) ? 0 : 1;
+}
+/* ------------------------------------------------------------------------ */
+/* Full sweep: 150/300/600 kbit, all setpoints, several repetitions          */
+/* ------------------------------------------------------------------------ */
+
+static int gcapfsweep_run(unsigned runs)
+{
+	static const unsigned rates[] = {150u, 300u, 600u};
+	static const unsigned throttles[] = {0u, 10u, 25u, 50u, 75u, 90u, 100u};
+	unsigned total_pass = 0, total_frames = 0;
+
+	gcapf_quiet = true;
+
+	for (unsigned r = 0; r < sizeof(rates) / sizeof(rates[0]); r++) {
+		unsigned pass = 0, frames = 0;
+
+		for (unsigned run = 0; run < runs; run++) {
+			for (unsigned k = 0; k < sizeof(throttles) / sizeof(throttles[0]); k++) {
+				const int rc = gcapf_run(rates[r], throttles[k]);
+				frames++;
+
+				if (rc == 0) {
+					pass++;
+				}
+			}
+		}
+
+		PX4_INFO("gcapfsweep: %3u kbit/s : %u/%u MATCH", rates[r], pass, frames);
+		total_pass += pass;
+		total_frames += frames;
+	}
+
+	gcapf_quiet = false;
+
+	PX4_INFO("gcapfsweep: total %u/%u MATCH", total_pass, total_frames);
+
+	return (total_pass == total_frames) ? 0 : 1;
 }
 extern "C" int pwmv2test_main(int argc, char *argv[])
 {
@@ -2682,6 +2723,10 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 		const unsigned thr = (argc > 3) ? strtoul(argv[3], nullptr, 0) : 50u;
 
 		return gcapf_run(rate, thr);
+	}
+
+	if (argc > 1 && strcmp(argv[1], "gcapfsweep") == 0) {
+		return gcapfsweep_run((argc > 2) ? strtoul(argv[2], nullptr, 0) : 3u);
 	}
 
 	if (argc > 1 && strcmp(argv[1], "pollscan") == 0) {
