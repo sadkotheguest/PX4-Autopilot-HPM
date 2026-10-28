@@ -2535,6 +2535,7 @@ extern "C" void up_dshot_rxf_stop(void);
 extern "C" const uint32_t *up_dshot_rxf_buffer(void);
 extern "C" unsigned up_dshot_rxf_words(void);
 extern "C" void up_dshot_rxf_deinit(void);
+extern "C" void up_dshot_rxf_state(void);
 
 static bool gcapf_quiet;
 
@@ -2723,6 +2724,11 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 		const unsigned thr = (argc > 3) ? strtoul(argv[3], nullptr, 0) : 50u;
 
 		return gcapf_run(rate, thr);
+	}
+
+	if (argc > 1 && strcmp(argv[1], "rxfstate") == 0) {
+		up_dshot_rxf_state();
+		return 0;
 	}
 
 	if (argc > 1 && strcmp(argv[1], "gcapfsweep") == 0) {

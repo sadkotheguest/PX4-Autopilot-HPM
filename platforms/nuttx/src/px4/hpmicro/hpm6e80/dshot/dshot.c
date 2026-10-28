@@ -1650,7 +1650,39 @@ int up_dshot_rxf_init(void)
 	 */
 	rxf_res.base->CHCTRL[rxf_res.channel].CTRL |= DMAV2_CHCTRL_CTRL_SRC_FIXBURST_MASK;
 
+	/* Make the request routing explicit as well: without an enabled DMAMUX entry
+	 * the channel has no request source and no transfer ever happens.
+	 */
+	HPM_DMAMUX->MUXCFG[DMA_SOC_CHN_TO_DMAMUX_CHN(rxf_res.base, rxf_res.channel)] =
+		DMAMUX_MUXCFG_SOURCE_SET(HPM_DMA_SRC_GPTMR0_3) | DMAMUX_MUXCFG_ENABLE_SET(1);
+
 	return OK;
+}
+
+static void rxf_channel_reset(void)
+{
+	/* Abort an in-flight transfer first: writing CTRL alone leaves the internal
+	 * counter and destination pointer untouched, so the next setup would resume
+	 * in the middle of the buffer (TRANSIZE 94 / DST +8 instead of 96 / base).
+	 */
+	const uint32_t mask = 1u << rxf_res.channel;
+
+	if (rxf_res.base->CHEN & mask) {
+		dma_abort_channel(rxf_res.base, mask);
+
+		for (unsigned i = 0; i < 100000u; i++) {
+			if ((rxf_res.base->CHEN & mask) == 0u) {
+				break;
+			}
+		}
+	}
+
+	/* Hard-reset the channel: the frame usually ends before the 48-event buffer
+	 * is filled, so the transfer is still active at stop and the next setup
+	 * would continue it from the middle (leftover TRANSIZE/DST).
+	 */
+	rxf_res.base->CHCTRL[rxf_res.channel].CTRL = 0;
+	dma_clear_transfer_status(rxf_res.base, rxf_res.channel);
 }
 
 void up_dshot_rxf_start(void)
@@ -1662,7 +1694,7 @@ void up_dshot_rxf_start(void)
 	gptmr_channel_reset_count(HPM_GPTMR0, DSHOT_RXF_CHANNEL);
 	gptmr_clear_status(HPM_GPTMR0, GPTMR_CH_CAP_STAT_MASK(DSHOT_RXF_CHANNEL));
 	memset(rxf_buf, 0, sizeof(rxf_buf));
-	dma_clear_transfer_status(rxf_res.base, rxf_res.channel);
+	rxf_channel_reset();
 
 	if (dma_mgr_setup_channel(&rxf_res, &rxf_conf) != status_success) {
 		PX4_ERR("rxf: setup failed (ch %u)", (unsigned)rxf_res.channel);
@@ -1671,13 +1703,21 @@ void up_dshot_rxf_start(void)
 
 	rxf_res.base->CHCTRL[rxf_res.channel].CTRL |= DMAV2_CHCTRL_CTRL_SRC_FIXBURST_MASK;
 
+	HPM_DMAMUX->MUXCFG[DMA_SOC_CHN_TO_DMAMUX_CHN(rxf_res.base, rxf_res.channel)] =
+		DMAMUX_MUXCFG_SOURCE_SET(HPM_DMA_SRC_GPTMR0_3) | DMAMUX_MUXCFG_ENABLE_SET(1);
+
+	gptmr_clear_status(HPM_GPTMR0, GPTMR_CH_CAP_STAT_MASK(DSHOT_RXF_CHANNEL));
+
 	if (dma_mgr_enable_channel(&rxf_res) != status_success) {
 		PX4_ERR("rxf: enable failed (ch %u)", (unsigned)rxf_res.channel);
 		return;
 	}
 
-	PX4_DEBUG("rxf: armed ch %u CHEN 0x%08x CTRL 0x%08x", (unsigned)rxf_res.channel,
+	PX4_INFO("rxf: armed ch %u CHEN 0x%08x TRANSIZE %u SRC 0x%08x DST 0x%08x CTRL 0x%08x", (unsigned)rxf_res.channel,
 		  (unsigned)rxf_res.base->CHEN,
+		  (unsigned)rxf_res.base->CHCTRL[rxf_res.channel].TRANSIZE,
+		  (unsigned)rxf_res.base->CHCTRL[rxf_res.channel].SRCADDR,
+		  (unsigned)rxf_res.base->CHCTRL[rxf_res.channel].DSTADDR,
 		  (unsigned)rxf_res.base->CHCTRL[rxf_res.channel].CTRL);
 
 	gptmr_start_counter(HPM_GPTMR0, DSHOT_RXF_CHANNEL);
@@ -1690,7 +1730,9 @@ void up_dshot_rxf_stop(void)
 	}
 
 	gptmr_stop_counter(HPM_GPTMR0, DSHOT_RXF_CHANNEL);
+	gptmr_clear_status(HPM_GPTMR0, GPTMR_CH_CAP_STAT_MASK(DSHOT_RXF_CHANNEL));
 	dma_mgr_disable_channel(&rxf_res);
+	rxf_channel_reset();
 }
 
 const uint32_t *up_dshot_rxf_buffer(void)
@@ -1703,6 +1745,30 @@ unsigned up_dshot_rxf_words(void)
 	return DSHOT_RXF_EVENTS * 2u;
 }
 
+void up_dshot_rxf_state(void)
+{
+	const uint32_t ch = DSHOT_RXF_CHANNEL;
+
+	clock_add_to_group(clock_gptmr0, 0);
+	clock_add_to_group(clock_hdma, 0);
+
+	PX4_INFO("rxfstate: CR 0x%08x SR 0x%08x CNT %u CAPPOS %u CAPNEG %u CAPDTY %u CAPPRD %u",
+		 (unsigned)HPM_GPTMR0->CHANNEL[ch].CR,
+		 (unsigned)HPM_GPTMR0->SR,
+		 (unsigned)HPM_GPTMR0->CHANNEL[ch].CNT,
+		 (unsigned)(HPM_GPTMR0->CHANNEL[ch].CAPPOS & 0xFFFFFFu),
+		 (unsigned)(HPM_GPTMR0->CHANNEL[ch].CAPNEG & 0xFFFFFFu),
+		 (unsigned)HPM_GPTMR0->CHANNEL[ch].CAPDTY,
+		 (unsigned)HPM_GPTMR0->CHANNEL[ch].CAPPRD);
+
+	if (rxf_allocated) {
+		PX4_INFO("rxfstate: dma base 0x%08x ch %u CHEN 0x%08x CTRL 0x%08x MUX 0x%08x",
+			 (unsigned)(uintptr_t)rxf_res.base, (unsigned)rxf_res.channel,
+			 (unsigned)rxf_res.base->CHEN,
+			 (unsigned)rxf_res.base->CHCTRL[rxf_res.channel].CTRL,
+			 (unsigned)HPM_DMAMUX->MUXCFG[DMA_SOC_CHN_TO_DMAMUX_CHN(rxf_res.base, rxf_res.channel)]);
+	}
+}
 void up_dshot_rxf_deinit(void)
 {
 	if (!rxf_allocated) {
@@ -1710,7 +1776,18 @@ void up_dshot_rxf_deinit(void)
 	}
 
 	gptmr_stop_counter(HPM_GPTMR0, DSHOT_RXF_CHANNEL);
+	gptmr_channel_enable_dma_request(HPM_GPTMR0, DSHOT_RXF_CHANNEL, false);
+	rxf_channel_reset();
+	gptmr_clear_status(HPM_GPTMR0, GPTMR_CH_CAP_STAT_MASK(DSHOT_RXF_CHANNEL));
+
 	dma_mgr_disable_channel(&rxf_res);
+
+	/* Drop the DMAMUX mapping: otherwise the released channel keeps listening on
+	 * GPTMR0_3 and the next run ends up with two channels on one request source,
+	 * which starves the new channel (zero captured events on re-arm).
+	 */
+	HPM_DMAMUX->MUXCFG[DMA_SOC_CHN_TO_DMAMUX_CHN(rxf_res.base, rxf_res.channel)] = 0;
+
 	dma_mgr_release_resource(&rxf_res);
 	rxf_allocated = false;
 }
