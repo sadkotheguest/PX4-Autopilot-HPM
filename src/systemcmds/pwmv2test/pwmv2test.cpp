@@ -2713,6 +2713,8 @@ static int gcapfsweep_run(unsigned runs)
 
 extern "C" bool up_dshot_rxd_init(void);
 extern "C" void up_dshot_rxd_start(void);
+extern "C" void up_dshot_idle(void);
+extern "C" bool up_dshot_frame_done(void);
 extern "C" void up_dshot_rxd_stop(void);
 extern "C" const uint32_t *up_dshot_rxd_buffer(void);
 extern "C" unsigned up_dshot_rxd_words(void);
@@ -2752,12 +2754,16 @@ static int gcapx_run(unsigned rate_kbit, unsigned throttle_percent)
 
 	uint32_t spin = 0;
 
-	while (spin++ < 2000000u && up_dshot_tc_count() == 0) {
+	while (spin++ < 2000000u && !up_dshot_frame_done()) {
 	}
 
 	usleep(500);
 	up_dshot_rxd_stop();
-	up_dshot_arm(false);
+
+	/* TX stays armed (push-pull) between frames; force the idle low level from
+	 * thread context so the next frame starts from a defined state.
+	 */
+	up_dshot_idle();
 
 	const uint32_t gclk = clock_get_frequency(clock_gptmr0);
 	const uint32_t bit_ticks = gclk / (rate_kbit * 1000u);
@@ -2773,7 +2779,8 @@ static int gcapx_run(unsigned rate_kbit, unsigned throttle_percent)
 		const uint32_t dty = buf[i + 1u];
 
 		if (prd == 0u && dty == 0u) {
-			break;
+			/* entries that were never written: skip, do not abort the scan */
+			continue;
 		}
 
 		events++;

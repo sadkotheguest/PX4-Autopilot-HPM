@@ -155,8 +155,13 @@ static void dshot_build_channel(unsigned channel)
 			dshot_cmp((channel_frame[channel] >> (15 - i)) & 1) << 8;
 	}
 
+	/* Words past the data carry a compare value ABOVE the period: the comparator
+	 * never matches, so no pulse is generated and the output stays low.  The last
+	 * word written by the DMA is therefore an idle level - no need for Hi-Z and no
+	 * need to stop the counter.
+	 */
 	for (unsigned i = DSHOT_DATA_WORDS; i < DSHOT_FRAME_WORDS; i++) {
-		frame_buf[i * num_channels + channel] = reload << 8;
+		frame_buf[i * num_channels + channel] = (reload + (reload / 2u)) << 8;
 	}
 }
 
@@ -166,7 +171,9 @@ static void dshot_tc_cb(DMA_Type *base, uint32_t channel, void *cb_data)
 	(void)channel;
 	(void)cb_data;
 
-	pwmv2_disable_counter(pwm, counter);
+	/* Only account for the completion; the PWM counter keeps running with the
+	 * trailing idle word so the line stays low until the next re-arm.
+	 */
 	tc_count++;
 }
 
@@ -447,6 +454,36 @@ void up_dshot_trigger(void)
 	pwmv2_reset_counter(pwm, counter);
 	pwmv2_enable_counter(pwm, counter);
 	pwmv2_start_pwm_output(pwm, counter);
+}
+
+void up_dshot_idle(void)
+{
+	if (!initialized) {
+		return;
+	}
+
+	/* Force "no pulse" so the line returns to idle low.  Called from thread
+	 * context - writing the shadows from the DMA TC interrupt deadlocks against
+	 * the DMA writing the same registers.
+	 */
+	pwmv2_shadow_register_unlock(pwm);
+
+	for (unsigned ch = 0; ch < num_channels; ch++) {
+		pwmv2_set_shadow_val(pwm, dshot_shadow(ch), reload + (reload / 2u), 0, false);
+	}
+
+	pwmv2_shadow_register_lock(pwm);
+}
+
+bool up_dshot_frame_done(void)
+{
+	if (!dma_allocated) {
+		return true;
+	}
+
+	/* Poll the channel state instead of using an interrupt: the linked list ends
+	 * at the last descriptor, so the controller disables the channel itself. */
+	return (dma_res.base->CHEN & (1u << dma_res.channel)) == 0u;
 }
 
 unsigned up_dshot_frame_words(void)
@@ -1823,6 +1860,21 @@ void up_dshot_rxf_deinit(void)
 static uint32_t rxd_buf[DSHOT_RXD_EVENTS * 2u] __attribute__((section(".ahb_sram")));
 static bool rxd_ready;
 
+/* ---------------------------------------------------------------------- */
+/* Receive pad setup: force the pad to input (Hi-Z) before muxing it to    */
+/* TRGM.  Without clearing the GPIO output enable, a pad that was used as  */
+/* an output earlier keeps driving the net and fights the transmitting pin.*/
+/* ---------------------------------------------------------------------- */
+static void dshot_rx_pad_input(void)
+{
+	HPM_GPIO0->OE[GPIO_DI_GPIOE].VALUE &= ~(1u << 9);
+	HPM_IOC->PAD[IOC_PAD_PE09].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(17);
+	/* keep the pull-down: the transmitting pad is Hi-Z until the frame starts,
+	 * and a floating line produces junk capture events.
+	 */
+	HPM_IOC->PAD[IOC_PAD_PE09].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
+}
+
 bool up_dshot_rxd_init(void)
 {
 	const unsigned pin = 9u;   /* PE09 */
@@ -1830,8 +1882,7 @@ bool up_dshot_rxd_init(void)
 	clock_add_to_group(clock_gptmr0, 0);
 	clock_add_to_group(clock_xdma, 0);
 
-	HPM_IOC->PAD[IOC_PAD_PE09].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(17);
-	HPM_IOC->PAD[IOC_PAD_PE09].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
+	dshot_rx_pad_input();
 
 	trgm_filter_t filter = {};
 	filter.mode = trgm_filter_mode_rapid_change;
