@@ -1806,6 +1806,149 @@ void up_dshot_rxf_deinit(void)
 	dma_mgr_release_resource(&rxf_res);
 	rxf_allocated = false;
 }
+/* ---------------------------------------------------------------------- */
+/* Receive via XDMA: one 64-bit read of (CAPPRD, CAPDTY) per capture event */
+/* ---------------------------------------------------------------------- */
+/*
+ * Follows the SDK gptmr/pwm_measure example: the GPTMR channel runs in measure
+ * mode and XDMA moves both measurement registers in a single double-word
+ * transfer, so every event yields one (period, width) pair.  XDMA is a separate
+ * controller from HDMA (used by the transmit chain), so the two do not compete.
+ */
+
+#define DSHOT_RXD_EVENTS   32u
+#define DSHOT_RXD_CHANNEL  3u
+#define DSHOT_RXD_DMA_CH   0u
+
+static uint32_t rxd_buf[DSHOT_RXD_EVENTS * 2u] __attribute__((section(".ahb_sram")));
+static bool rxd_ready;
+
+bool up_dshot_rxd_init(void)
+{
+	const unsigned pin = 9u;   /* PE09 */
+
+	clock_add_to_group(clock_gptmr0, 0);
+	clock_add_to_group(clock_xdma, 0);
+
+	HPM_IOC->PAD[IOC_PAD_PE09].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(17);
+	HPM_IOC->PAD[IOC_PAD_PE09].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
+
+	trgm_filter_t filter = {};
+	filter.mode = trgm_filter_mode_rapid_change;
+	filter.filter_length = 8;
+	trgm_filter_config(HPM_TRGM0, pin, &filter);
+
+	trgm_output_t out = {};
+	out.input = HPM_TRGM0_INPUT_SRC_TRGM0_P00 + pin;
+	out.type = trgm_output_same_as_input;
+	out.invert = false;
+	trgm_output_config(HPM_TRGM0, HPM_TRGM0_OUTPUT_SRC_GPTMR0_IN3, &out);
+
+	/* Measure mode: the timer computes period and width itself. */
+	gptmr_channel_config_t cfg;
+	gptmr_channel_get_default_config(HPM_GPTMR0, &cfg);
+	cfg.mode = gptmr_work_mode_measure_width;
+	cfg.cmp_initial_polarity_high = false;
+	cfg.dma_request_event = gptmr_dma_request_on_input_signal_toggle;
+	gptmr_channel_enable_dma_request(HPM_GPTMR0, DSHOT_RXD_CHANNEL, false);
+
+	if (gptmr_channel_config(HPM_GPTMR0, DSHOT_RXD_CHANNEL, &cfg, false) != status_success) {
+		return false;
+	}
+
+	dma_channel_config_t conf;
+	dma_default_channel_config(HPM_XDMA, &conf);
+	conf.src_addr = (uint32_t)&HPM_GPTMR0->CHANNEL[DSHOT_RXD_CHANNEL].CAPPRD;
+	conf.dst_addr = (uint32_t)rxd_buf;
+	conf.src_mode = DMA_HANDSHAKE_MODE_HANDSHAKE;
+	conf.dst_mode = DMA_HANDSHAKE_MODE_NORMAL;
+	conf.src_width = DMA_TRANSFER_WIDTH_DOUBLE_WORD;
+	conf.dst_width = DMA_TRANSFER_WIDTH_DOUBLE_WORD;
+	conf.src_addr_ctrl = DMA_ADDRESS_CONTROL_FIXED;
+	conf.dst_addr_ctrl = DMA_ADDRESS_CONTROL_INCREMENT;
+	conf.src_burst_size = DMA_NUM_TRANSFER_PER_BURST_1T;
+	conf.size_in_byte = DSHOT_RXD_EVENTS * 2u * sizeof(uint32_t);
+	conf.interrupt_mask = DMA_INTERRUPT_MASK_ALL & ~DMA_INTERRUPT_MASK_TERMINAL_COUNT;
+
+	dma_disable_channel(HPM_XDMA, DSHOT_RXD_DMA_CH);
+
+	if (dma_setup_channel(HPM_XDMA, DSHOT_RXD_DMA_CH, &conf, false) != status_success) {
+		return false;
+	}
+
+	dmamux_config(HPM_DMAMUX, DMA_SOC_CHN_TO_DMAMUX_CHN(HPM_XDMA, DSHOT_RXD_DMA_CH),
+		      HPM_DMA_SRC_GPTMR0_3, true);
+
+	gptmr_channel_enable_dma_request(HPM_GPTMR0, DSHOT_RXD_CHANNEL, true);
+
+	rxd_ready = true;
+
+	return true;
+}
+
+void up_dshot_rxd_start(void)
+{
+	if (!rxd_ready) {
+		return;
+	}
+
+	gptmr_channel_reset_count(HPM_GPTMR0, DSHOT_RXD_CHANNEL);
+	gptmr_clear_status(HPM_GPTMR0, GPTMR_CH_CAP_STAT_MASK(DSHOT_RXD_CHANNEL));
+	memset(rxd_buf, 0, sizeof(rxd_buf));
+
+	dma_disable_channel(HPM_XDMA, DSHOT_RXD_DMA_CH);
+	dma_abort_channel(HPM_XDMA, 1u << DSHOT_RXD_DMA_CH);
+
+	for (unsigned i = 0; i < 100000u; i++) {
+		if ((HPM_XDMA->CHEN & (1u << DSHOT_RXD_DMA_CH)) == 0u) {
+			break;
+		}
+	}
+
+	HPM_XDMA->CHCTRL[DSHOT_RXD_DMA_CH].CTRL = 0;
+	dma_clear_transfer_status(HPM_XDMA, DSHOT_RXD_DMA_CH);
+
+	dma_channel_config_t conf;
+	dma_default_channel_config(HPM_XDMA, &conf);
+	conf.src_addr = (uint32_t)&HPM_GPTMR0->CHANNEL[DSHOT_RXD_CHANNEL].CAPPRD;
+	conf.dst_addr = (uint32_t)rxd_buf;
+	conf.src_mode = DMA_HANDSHAKE_MODE_HANDSHAKE;
+	conf.dst_mode = DMA_HANDSHAKE_MODE_NORMAL;
+	conf.src_width = DMA_TRANSFER_WIDTH_DOUBLE_WORD;
+	conf.dst_width = DMA_TRANSFER_WIDTH_DOUBLE_WORD;
+	conf.src_addr_ctrl = DMA_ADDRESS_CONTROL_FIXED;
+	conf.dst_addr_ctrl = DMA_ADDRESS_CONTROL_INCREMENT;
+	conf.src_burst_size = DMA_NUM_TRANSFER_PER_BURST_1T;
+	conf.size_in_byte = DSHOT_RXD_EVENTS * 2u * sizeof(uint32_t);
+	conf.interrupt_mask = DMA_INTERRUPT_MASK_ALL & ~DMA_INTERRUPT_MASK_TERMINAL_COUNT;
+
+	if (dma_setup_channel(HPM_XDMA, DSHOT_RXD_DMA_CH, &conf, false) != status_success) {
+		return;
+	}
+
+	dmamux_config(HPM_DMAMUX, DMA_SOC_CHN_TO_DMAMUX_CHN(HPM_XDMA, DSHOT_RXD_DMA_CH),
+		      HPM_DMA_SRC_GPTMR0_3, true);
+
+	dma_enable_channel(HPM_XDMA, DSHOT_RXD_DMA_CH);
+	gptmr_start_counter(HPM_GPTMR0, DSHOT_RXD_CHANNEL);
+}
+
+void up_dshot_rxd_stop(void)
+{
+	gptmr_stop_counter(HPM_GPTMR0, DSHOT_RXD_CHANNEL);
+	dma_disable_channel(HPM_XDMA, DSHOT_RXD_DMA_CH);
+	dma_abort_channel(HPM_XDMA, 1u << DSHOT_RXD_DMA_CH);
+}
+
+const uint32_t *up_dshot_rxd_buffer(void)
+{
+	return rxd_buf;
+}
+
+unsigned up_dshot_rxd_words(void)
+{
+	return DSHOT_RXD_EVENTS * 2u;
+}
 /* Bidirectional DShot is not implemented yet; keep the API consistent. */
 int up_bdshot_num_erpm_ready(void) { return 0; }
 int up_bdshot_get_erpm(uint8_t channel, int *erpm) { (void)channel; if (erpm) { *erpm = 0; } return -ENOSYS; }

@@ -2707,6 +2707,146 @@ static int gcapfsweep_run(unsigned runs)
 
 	return (total_pass == total_frames) ? 0 : 1;
 }
+/* ------------------------------------------------------------------------ */
+/* XDMA pair receiver: one (CAPPRD, CAPDTY) 64-bit read per capture event    */
+/* ------------------------------------------------------------------------ */
+
+extern "C" bool up_dshot_rxd_init(void);
+extern "C" void up_dshot_rxd_start(void);
+extern "C" void up_dshot_rxd_stop(void);
+extern "C" const uint32_t *up_dshot_rxd_buffer(void);
+extern "C" unsigned up_dshot_rxd_words(void);
+
+static bool gcapx_quiet;
+
+static int gcapx_run(unsigned rate_kbit, unsigned throttle_percent)
+{
+	up_dshot_deinit();
+
+	if (up_dshot_init(0x1, rate_kbit * 1000u, false) != OK) {
+		PX4_ERR("gcapx: dshot init failed");
+		return 1;
+	}
+
+	if (!up_dshot_rxd_init()) {
+		PX4_ERR("gcapx: capture init failed");
+		return 1;
+	}
+
+	uint32_t throttle = 48u + throttle_percent * 2000u / 100u;
+
+	if (throttle > 2047u) {
+		throttle = 2047u;
+	}
+
+	const uint16_t packet = (uint16_t)((throttle << 1) & 0xFFFFu);
+	const uint16_t crc = (packet ^ (packet >> 4) ^ (packet >> 8)) & 0x0F;
+	const uint16_t sent = (uint16_t)((packet << 4) | crc);
+
+	dshot_motor_data_set(0, (uint16_t)throttle, false);
+	up_dshot_arm(true);
+	up_dshot_tc_reset();
+	up_dshot_rxd_start();
+	usleep(200);
+	up_dshot_trigger();
+
+	uint32_t spin = 0;
+
+	while (spin++ < 2000000u && up_dshot_tc_count() == 0) {
+	}
+
+	usleep(500);
+	up_dshot_rxd_stop();
+	up_dshot_arm(false);
+
+	const uint32_t gclk = clock_get_frequency(clock_gptmr0);
+	const uint32_t bit_ticks = gclk / (rate_kbit * 1000u);
+	const uint32_t *buf = up_dshot_rxd_buffer();
+	const unsigned words = up_dshot_rxd_words();
+
+	/* Each entry is (period, width); measure mode reports the PREVIOUS pulse. */
+	uint16_t frame = 0;
+	unsigned bits = 0, events = 0;
+
+	for (unsigned i = 0; i + 1u < words; i += 2u) {
+		const uint32_t prd = buf[i];
+		const uint32_t dty = buf[i + 1u];
+
+		if (prd == 0u && dty == 0u) {
+			break;
+		}
+
+		events++;
+
+		if (events == 1u) {
+			/* stale measurement from before the frame */
+			continue;
+		}
+
+		if (dty == 0u || dty > (bit_ticks + (bit_ticks / 2u))) {
+			continue;
+		}
+
+		if (bits < 16u) {
+			frame = (uint16_t)((frame << 1) | ((dty > (bit_ticks / 2u)) ? 1u : 0u));
+			bits++;
+		}
+	}
+
+	bool match = false;
+
+	if (!gcapx_quiet) {
+		PX4_INFO("gcapx: %u kbit/s, thr %u, sent 0x%04x recv 0x%04x (%u bits, %u events) -> %s",
+		 rate_kbit, (unsigned)throttle, (unsigned)sent, (unsigned)frame, bits, events,
+		 (bits >= 15u && frame == (uint16_t)(sent >> (16u - bits))) ? "MATCH" : "MISMATCH");
+	}
+
+	match = (bits >= 15u) && (frame == (uint16_t)(sent >> (16u - bits)));
+
+	if (!gcapx_quiet) {
+		for (unsigned i = 0; i + 1u < words && i < 8u; i += 2u) {
+			PX4_INFO("gcapx: [%u] prd %u dty %u", i / 2u, (unsigned)buf[i], (unsigned)buf[i + 1u]);
+		}
+	}
+
+	return match ? 0 : 1;
+}
+/* ------------------------------------------------------------------------ */
+/* XDMA sweep over 150/300/600 kbit and all setpoints                        */
+/* ------------------------------------------------------------------------ */
+
+static int gcapxsweep_run(unsigned runs)
+{
+	static const unsigned rates[] = {150u, 300u, 600u};
+	static const unsigned throttles[] = {0u, 10u, 25u, 50u, 75u, 90u, 100u};
+	unsigned total_pass = 0, total_frames = 0;
+
+	gcapx_quiet = true;
+
+	for (unsigned r = 0; r < sizeof(rates) / sizeof(rates[0]); r++) {
+		unsigned pass = 0, frames = 0;
+
+		for (unsigned run = 0; run < runs; run++) {
+			for (unsigned k = 0; k < sizeof(throttles) / sizeof(throttles[0]); k++) {
+				if (gcapx_run(rates[r], throttles[k]) == 0) {
+					pass++;
+				}
+
+				frames++;
+			}
+		}
+
+		PX4_INFO("gcapxsweep: %3u kbit/s : %u/%u MATCH", rates[r], pass, frames);
+		total_pass += pass;
+		total_frames += frames;
+	}
+
+	gcapx_quiet = false;
+
+	PX4_INFO("gcapxsweep: total %u/%u MATCH", total_pass, total_frames);
+
+	return (total_pass == total_frames) ? 0 : 1;
+}
 extern "C" int pwmv2test_main(int argc, char *argv[])
 {
 	uint32_t frequency = 1000;
@@ -2732,6 +2872,17 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 	if (argc > 1 && strcmp(argv[1], "rxfstate") == 0) {
 		up_dshot_rxf_state();
 		return 0;
+	}
+
+	if (argc > 1 && strcmp(argv[1], "gcapxsweep") == 0) {
+		return gcapxsweep_run((argc > 2) ? strtoul(argv[2], nullptr, 0) : 3u);
+	}
+
+	if (argc > 1 && strcmp(argv[1], "gcapx") == 0) {
+		const unsigned rate = (argc > 2) ? strtoul(argv[2], nullptr, 0) : 600u;
+		const unsigned thr = (argc > 3) ? strtoul(argv[3], nullptr, 0) : 50u;
+
+		return gcapx_run(rate, thr);
 	}
 
 	if (argc > 1 && strcmp(argv[1], "gcapfsweep") == 0) {
