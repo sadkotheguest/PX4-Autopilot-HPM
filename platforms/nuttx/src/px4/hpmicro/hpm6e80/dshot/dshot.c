@@ -81,8 +81,8 @@
 #include "hpm_trgmmux_src.h"
 
 /* 16 bit times per frame: bit15 preloaded, DMA sends bit14..bit0 + idle. */
-#define DSHOT_FRAME_WORDS   16u   /* bit15 preloaded + bit14..bit0 + idle */
-#define DSHOT_DATA_WORDS    15u
+#define DSHOT_FRAME_WORDS   17u   /* bit15..bit0 + idle (word0 is consumed at arm) */
+#define DSHOT_DATA_WORDS    16u
 
 #define DSHOT_MAX_CHANNELS  4u
 #define DSHOT_BIT_SLOT0     PWMV2_SHADOW_INDEX(20)   /* duty slots 20..23 */
@@ -146,9 +146,13 @@ static void dshot_build_channel(unsigned channel)
 		return;
 	}
 
+	/* Word 0 carries bit15: the DMA performs one transfer immediately when the
+	 * channel is enabled (before the counter starts), so that transfer places
+	 * bit15 into the shadow and the rest of the chain follows on compare events.
+	 */
 	for (unsigned i = 0; i < DSHOT_DATA_WORDS; i++) {
 		frame_buf[i * num_channels + channel] =
-			dshot_cmp((channel_frame[channel] >> (14 - i)) & 1) << 8;
+			dshot_cmp((channel_frame[channel] >> (15 - i)) & 1) << 8;
 	}
 
 	for (unsigned i = DSHOT_DATA_WORDS; i < DSHOT_FRAME_WORDS; i++) {
@@ -388,6 +392,14 @@ void dshot_motor_data_set(unsigned channel, uint16_t throttle, bool telemetry)
 	channel_frame[channel] = (uint16_t)((packet << 4) | crc);
 
 	dshot_build_channel(channel);
+
+	/* Preload bit 15 straight into the shadow here, long before the DMA chain is
+	 * armed, so the first chain write cannot overwrite it before the first pulse
+	 * of the frame is generated.
+	 */
+	pwmv2_shadow_register_unlock(pwm);
+	pwmv2_set_shadow_val(pwm, dshot_shadow(channel), reload, 0, false);
+	pwmv2_shadow_register_lock(pwm);
 }
 
 int up_dshot_arm(bool arm)
@@ -416,17 +428,8 @@ void up_dshot_trigger(void)
 		return;
 	}
 
-	/* Preload bit 15 of every channel; the DMA sends bit14..bit0. */
-	pwmv2_shadow_register_unlock(pwm);
-
-	for (unsigned ch = 0; ch < num_channels; ch++) {
-		pwmv2_set_shadow_val(pwm, dshot_shadow(ch),
-				     dshot_cmp((channel_frame[ch] >> 15) & 1), 0, false);
-	}
-
-	/* Enable the shadow lock so the duty shadows written by the DMA are applied
-	 * on the comparator update trigger (reload) instead of immediately; without
-	 * it a mid-period write makes the comparator match twice.
+	/* bit15 was preloaded when the frame was set; here only the lock event and
+	 * the DMA chain are (re)armed.
 	 */
 	pwmv2_shadow_register_lock(pwm);
 
