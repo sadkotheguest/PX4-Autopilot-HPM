@@ -2715,6 +2715,7 @@ extern "C" bool up_dshot_rxd_init(void);
 extern "C" void up_dshot_rxd_start(void);
 extern "C" void up_dshot_idle(void);
 extern "C" bool up_dshot_frame_done(void);
+extern "C" void up_dshot_rxd_flush(void);
 extern "C" void up_dshot_rxd_stop(void);
 extern "C" const uint32_t *up_dshot_rxd_buffer(void);
 extern "C" unsigned up_dshot_rxd_words(void);
@@ -2735,6 +2736,8 @@ static int gcapx_run(unsigned rate_kbit, unsigned throttle_percent)
 		return 1;
 	}
 
+	up_dshot_arm(true);
+
 	uint32_t throttle = 48u + throttle_percent * 2000u / 100u;
 
 	if (throttle > 2047u) {
@@ -2746,10 +2749,11 @@ static int gcapx_run(unsigned rate_kbit, unsigned throttle_percent)
 	const uint16_t sent = (uint16_t)((packet << 4) | crc);
 
 	dshot_motor_data_set(0, (uint16_t)throttle, false);
-	up_dshot_arm(true);
 	up_dshot_tc_reset();
 	up_dshot_rxd_start();
 	usleep(200);
+	up_dshot_rxd_flush();
+	usleep(100);
 	up_dshot_trigger();
 
 	uint32_t spin = 0;
@@ -2790,7 +2794,10 @@ static int gcapx_run(unsigned rate_kbit, unsigned throttle_percent)
 			continue;
 		}
 
-		if (dty == 0u || dty > (bit_ticks + (bit_ticks / 2u))) {
+		/* Reject both empty entries and sub-bit glitches (the line shows ~10 ns
+		 * spikes right at the frame start); real bits are 37.5 % or 75 % of a bit.
+		 */
+		if (dty < (bit_ticks / 4u) || dty > (bit_ticks + (bit_ticks / 2u))) {
 			continue;
 		}
 
@@ -2810,7 +2817,14 @@ static int gcapx_run(unsigned rate_kbit, unsigned throttle_percent)
 
 	match = (bits >= 15u) && (frame == (uint16_t)(sent >> (16u - bits)));
 
-	if (!gcapx_quiet) {
+	if (!match) {
+		PX4_INFO("gcapx: FAILED frame, full pair dump:");
+
+		for (unsigned i = 0; i + 1u < words; i += 2u) {
+			PX4_INFO("gcapx: [%2u] prd %6u dty %6u", i / 2u, (unsigned)buf[i], (unsigned)buf[i + 1u]);
+		}
+
+	} else if (!gcapx_quiet) {
 		for (unsigned i = 0; i + 1u < words && i < 8u; i += 2u) {
 			PX4_INFO("gcapx: [%u] prd %u dty %u", i / 2u, (unsigned)buf[i], (unsigned)buf[i + 1u]);
 		}
@@ -2854,6 +2868,31 @@ static int gcapxsweep_run(unsigned runs)
 
 	return (total_pass == total_frames) ? 0 : 1;
 }
+/* ------------------------------------------------------------------------ */
+/* Repeat one frame until it fails, then dump that capture                   */
+/* ------------------------------------------------------------------------ */
+
+static int gcapxloop_run(unsigned rate_kbit, unsigned throttle_percent, unsigned max)
+{
+	gcapx_quiet = true;
+
+	for (unsigned i = 0; i < max; i++) {
+		const int rc = gcapx_run(rate_kbit, throttle_percent);
+
+		if (rc != 0) {
+			gcapx_quiet = false;
+			PX4_INFO("gcapxloop: failure at iteration %u (of %u)", i, max);
+			(void)gcapx_run(rate_kbit, throttle_percent);
+			PX4_INFO("gcapxloop: rerun above is the next frame; the failing dump was printed by iteration %u", i);
+			return 1;
+		}
+	}
+
+	gcapx_quiet = false;
+	PX4_INFO("gcapxloop: %u frames, all MATCH", max);
+
+	return 0;
+}
 extern "C" int pwmv2test_main(int argc, char *argv[])
 {
 	uint32_t frequency = 1000;
@@ -2879,6 +2918,14 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 	if (argc > 1 && strcmp(argv[1], "rxfstate") == 0) {
 		up_dshot_rxf_state();
 		return 0;
+	}
+
+	if (argc > 1 && strcmp(argv[1], "gcapxloop") == 0) {
+		const unsigned rate = (argc > 2) ? strtoul(argv[2], nullptr, 0) : 150u;
+		const unsigned thr = (argc > 3) ? strtoul(argv[3], nullptr, 0) : 50u;
+		const unsigned max = (argc > 4) ? strtoul(argv[4], nullptr, 0) : 200u;
+
+		return gcapxloop_run(rate, thr, max);
 	}
 
 	if (argc > 1 && strcmp(argv[1], "gcapxsweep") == 0) {

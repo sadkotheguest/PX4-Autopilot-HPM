@@ -212,14 +212,19 @@ static void dshot_pwm_init(void)
 		/* DMA writes this shadow: unlock that slot (bit = 2 + slot). */
 		pwm->UNLOCK |= (1u << (2u + shadow));
 
-		pwmv2_set_shadow_val(pwm, shadow, reload, 0, false);
+		/* "No pulse" from the very first period: a compare value ABOVE the period
+		 * never matches, so the line stays low until the frame data arrives.
+		 * Using `reload` here would produce a full-period pulse right after
+		 * initialisation and a junk capture event on the first frame.
+		 */
+		pwmv2_set_shadow_val(pwm, shadow, reload + (reload / 2u), 0, false);
 
 		/* The comparator has to reload its working value from the shadow on
 		 * every counter period, otherwise the duty written by the DMA for the
 		 * next bit never reaches the output.
 		 */
 		pwmv2_cmp_config_t cmp = {};
-		cmp.cmp = reload;
+		cmp.cmp = reload + (reload / 2u);
 		cmp.cmp_source = cmp_value_from_shadow_val;
 		cmp.cmp_source_index = shadow;
 		cmp.update_trigger = pwm_shadow_register_update_on_reload;
@@ -1984,6 +1989,45 @@ void up_dshot_rxd_start(void)
 	gptmr_start_counter(HPM_GPTMR0, DSHOT_RXD_CHANNEL);
 }
 
+void up_dshot_rxd_flush(void)
+{
+	/* Drain whatever the arming sequence captured (the line can show a short
+	 * spike right after the timer starts) and restart the XDMA transfer from
+	 * buffer entry 0 while the capture counter keeps running.
+	 */
+	dma_disable_channel(HPM_XDMA, DSHOT_RXD_DMA_CH);
+	dma_abort_channel(HPM_XDMA, 1u << DSHOT_RXD_DMA_CH);
+
+	for (unsigned i = 0; i < 100000u; i++) {
+		if ((HPM_XDMA->CHEN & (1u << DSHOT_RXD_DMA_CH)) == 0u) {
+			break;
+		}
+	}
+
+	HPM_XDMA->CHCTRL[DSHOT_RXD_DMA_CH].CTRL = 0;
+	dma_clear_transfer_status(HPM_XDMA, DSHOT_RXD_DMA_CH);
+	memset(rxd_buf, 0, sizeof(rxd_buf));
+
+	dma_channel_config_t conf;
+	dma_default_channel_config(HPM_XDMA, &conf);
+	conf.src_addr = (uint32_t)&HPM_GPTMR0->CHANNEL[DSHOT_RXD_CHANNEL].CAPPRD;
+	conf.dst_addr = (uint32_t)rxd_buf;
+	conf.src_mode = DMA_HANDSHAKE_MODE_HANDSHAKE;
+	conf.dst_mode = DMA_HANDSHAKE_MODE_NORMAL;
+	conf.src_width = DMA_TRANSFER_WIDTH_DOUBLE_WORD;
+	conf.dst_width = DMA_TRANSFER_WIDTH_DOUBLE_WORD;
+	conf.src_addr_ctrl = DMA_ADDRESS_CONTROL_FIXED;
+	conf.dst_addr_ctrl = DMA_ADDRESS_CONTROL_INCREMENT;
+	conf.src_burst_size = DMA_NUM_TRANSFER_PER_BURST_1T;
+	conf.size_in_byte = DSHOT_RXD_EVENTS * 2u * sizeof(uint32_t);
+	conf.interrupt_mask = DMA_INTERRUPT_MASK_ALL & ~DMA_INTERRUPT_MASK_TERMINAL_COUNT;
+
+	if (dma_setup_channel(HPM_XDMA, DSHOT_RXD_DMA_CH, &conf, false) == status_success) {
+		dmamux_config(HPM_DMAMUX, DMA_SOC_CHN_TO_DMAMUX_CHN(HPM_XDMA, DSHOT_RXD_DMA_CH),
+			      HPM_DMA_SRC_GPTMR0_3, true);
+		dma_enable_channel(HPM_XDMA, DSHOT_RXD_DMA_CH);
+	}
+}
 void up_dshot_rxd_stop(void)
 {
 	gptmr_stop_counter(HPM_GPTMR0, DSHOT_RXD_CHANNEL);
