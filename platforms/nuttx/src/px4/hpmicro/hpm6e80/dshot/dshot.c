@@ -1713,7 +1713,8 @@ void up_dshot_rxf_start(void)
 		return;
 	}
 
-	PX4_INFO("rxf: armed ch %u CHEN 0x%08x TRANSIZE %u SRC 0x%08x DST 0x%08x CTRL 0x%08x", (unsigned)rxf_res.channel,
+	PX4_DEBUG("rxf: after-enable TRANSIZE %u DST 0x%08x", (unsigned)rxf_res.base->CHCTRL[rxf_res.channel].TRANSIZE, (unsigned)rxf_res.base->CHCTRL[rxf_res.channel].DSTADDR);
+	PX4_DEBUG("rxf: armed ch %u CHEN 0x%08x TRANSIZE %u SRC 0x%08x DST 0x%08x CTRL 0x%08x", (unsigned)rxf_res.channel,
 		  (unsigned)rxf_res.base->CHEN,
 		  (unsigned)rxf_res.base->CHCTRL[rxf_res.channel].TRANSIZE,
 		  (unsigned)rxf_res.base->CHCTRL[rxf_res.channel].SRCADDR,
@@ -1723,6 +1724,20 @@ void up_dshot_rxf_start(void)
 	gptmr_start_counter(HPM_GPTMR0, DSHOT_RXF_CHANNEL);
 }
 
+void up_dshot_rxf_flush(void)
+{
+	/* Drain whatever the arming sequence captured (starting the capture counter
+	 * can latch one edge when the line is high at that moment) and restart the
+	 * transfer from buffer entry 0 while the capture counter keeps running.
+	 */
+	rxf_channel_reset();
+	memset(rxf_buf, 0, sizeof(rxf_buf));
+
+	if (dma_mgr_setup_channel(&rxf_res, &rxf_conf) == status_success) {
+		rxf_res.base->CHCTRL[rxf_res.channel].CTRL |= DMAV2_CHCTRL_CTRL_SRC_FIXBURST_MASK;
+		dma_mgr_enable_channel(&rxf_res);
+	}
+}
 void up_dshot_rxf_stop(void)
 {
 	if (!rxf_allocated) {

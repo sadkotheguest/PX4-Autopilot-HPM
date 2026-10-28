@@ -2535,6 +2535,7 @@ extern "C" void up_dshot_rxf_stop(void);
 extern "C" const uint32_t *up_dshot_rxf_buffer(void);
 extern "C" unsigned up_dshot_rxf_words(void);
 extern "C" void up_dshot_rxf_deinit(void);
+extern "C" void up_dshot_rxf_flush(void);
 extern "C" void up_dshot_rxf_state(void);
 
 static bool gcapf_quiet;
@@ -2569,6 +2570,8 @@ static int gcapf_run(unsigned rate_kbit, unsigned throttle_percent)
 	usleep(50);
 	up_dshot_tc_reset();
 	up_dshot_rxf_start();
+	usleep(100);
+	up_dshot_rxf_flush();
 	usleep(50);
 	up_dshot_trigger();
 
