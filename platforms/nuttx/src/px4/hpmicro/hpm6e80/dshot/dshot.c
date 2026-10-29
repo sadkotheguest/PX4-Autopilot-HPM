@@ -68,6 +68,9 @@
 #include <nuttx/irq.h>
 #include <string.h>
 
+#include <px4_arch/dshot.h>
+#include <drivers/drv_dshot.h>
+
 #include "hpm_clock_drv.h"
 #include "hpm_soc_irq.h"
 #include "hpm_dma_mgr.h"
@@ -111,6 +114,7 @@ static dma_mgr_linked_descriptor_t dshot_desc[DSHOT_FRAME_WORDS]
 static uint32_t *frame_buf = frame_buf_ahb;
 
 static uint32_t reload;
+static uint32_t dshot_bit_hz;     /* bit rate, also needed by the receive decoder */
 static uint8_t channel_mask;      /* requested channels */
 static uint8_t num_channels;      /* burst size: 1, 2 or 4 */
 static uint16_t channel_frame[DSHOT_MAX_CHANNELS];
@@ -369,6 +373,7 @@ int up_dshot_init(uint32_t channel_mask_in, unsigned dshot_pwm_freq, bool enable
 	}
 
 	reload = clock / dshot_pwm_freq - 1;
+	dshot_bit_hz = dshot_pwm_freq;
 
 	for (unsigned ch = 0; ch < DSHOT_MAX_CHANNELS; ch++) {
 		channel_frame[ch] = 0;      /* throttle 0 */
@@ -1849,201 +1854,431 @@ void up_dshot_rxf_deinit(void)
 	rxf_allocated = false;
 }
 /* ---------------------------------------------------------------------- */
-/* Receive via XDMA: one 64-bit read of (CAPPRD, CAPDTY) per capture event */
+/* BDShot receive: GPTMR measure mode + XDMA pair capture                  */
 /* ---------------------------------------------------------------------- */
 /*
- * Follows the SDK gptmr/pwm_measure example: the GPTMR channel runs in measure
- * mode and XDMA moves both measurement registers in a single double-word
- * transfer, so every event yields one (period, width) pair.  XDMA is a separate
- * controller from HDMA (used by the transmit chain), so the two do not compete.
+ * Every pulse of the ESC reply is measured by a GPTMR channel in measure
+ * mode: the hardware latches the pulse period and width by itself.  XDMA
+ * moves both registers (CAPPRD, CAPDTY) in one 64-bit transfer per capture
+ * event, so one event yields one (period, width) pair and the CPU is not
+ * involved while the frame arrives.  The decoder below turns a window of
+ * pairs into a 16 bit DShot frame and validates its CRC.
+ *
+ * GPTMR channels 0 and 1 have dedicated input pads, channels 2 and 3 take
+ * their signal from TRGM, which is why the routing table is explicit.
+ * XDMA is a separate controller from the HDMA feeding the transmit chain, so
+ * transmit and receive can run at the same time; one GPTMR plus one XDMA
+ * channel per motor leaves room for four motors.
+ *
+ * Measure mode hands out the PREVIOUS pulse on every capture event, so the
+ * first pair of a window belongs to whatever happened before the frame.
  */
 
-#define DSHOT_RXD_EVENTS   32u
-#define DSHOT_RXD_CHANNEL  3u
-#define DSHOT_RXD_DMA_CH   0u
+#define BD_RX_CHANNELS   4u
+#define BD_RX_EVENTS     32u   /* pairs per channel, one pair per capture event */
 
-static uint32_t rxd_buf[DSHOT_RXD_EVENTS * 2u] __attribute__((section(".ahb_sram")));
-static bool rxd_ready;
+typedef struct bd_rx_ch_s {
+	uint8_t  gptmr;     /* 0 = GPTMR0, 1 = GPTMR1 */
+	uint8_t  ch;        /* GPTMR capture channel */
+	uint8_t  dma_ch;    /* XDMA channel */
+	uint8_t  trgm_out;  /* TRGM output routed to the capture input */
+	uint8_t  pin;       /* receive lead */
+	uint32_t dma_src;   /* DMAMUX request source */
+} bd_rx_ch_t;
 
-/* ---------------------------------------------------------------------- */
-/* Receive pad setup: force the pad to input (Hi-Z) before muxing it to    */
-/* TRGM.  Without clearing the GPIO output enable, a pad that was used as  */
-/* an output earlier keeps driving the net and fights the transmitting pin.*/
-/* ---------------------------------------------------------------------- */
-static void dshot_rx_pad_input(void)
+/* The receive leads are the jumper rig used during the bring-up (motor 0 line
+ * on PE08 looped back to PE09).  A real bidirectional ESC answers on the
+ * transmit line itself, so board integration has to point the table at the
+ * transmit pads and switch the pad function around the frame.
+ */
+static const bd_rx_ch_t bd_rx_ch[BD_RX_CHANNELS] = {
+	{ 0, 2, 0, HPM_TRGM0_OUTPUT_SRC_GPTMR0_IN2, 9,  HPM_DMA_SRC_GPTMR0_2 },
+	{ 0, 3, 1, HPM_TRGM0_OUTPUT_SRC_GPTMR0_IN3, 10, HPM_DMA_SRC_GPTMR0_3 },
+	{ 1, 2, 2, HPM_TRGM0_OUTPUT_SRC_GPTMR1_IN2, 11, HPM_DMA_SRC_GPTMR1_2 },
+	{ 1, 3, 3, HPM_TRGM0_OUTPUT_SRC_GPTMR1_IN3, 12, HPM_DMA_SRC_GPTMR1_3 },
+};
+
+static uint32_t bd_rx_buf[BD_RX_CHANNELS][BD_RX_EVENTS * 2u]
+	__attribute__((section(".ahb_sram")));
+static uint8_t bd_rx_mask;
+
+static GPTMR_Type *bd_rx_gptmr(const bd_rx_ch_t *r)
 {
-	HPM_GPIO0->OE[GPIO_DI_GPIOE].VALUE &= ~(1u << 9);
-	HPM_IOC->PAD[IOC_PAD_PE09].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(17);
-	/* keep the pull-down: the transmitting pad is Hi-Z until the frame starts,
-	 * and a floating line produces junk capture events.
-	 */
-	HPM_IOC->PAD[IOC_PAD_PE09].PAD_CTL = IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
+	return r->gptmr ? HPM_GPTMR1 : HPM_GPTMR0;
 }
 
-bool up_dshot_rxd_init(void)
+static bool bd_rx_channel_valid(uint8_t channel)
 {
-	const unsigned pin = 9u;   /* PE09 */
+	return (channel < BD_RX_CHANNELS) && ((bd_rx_mask & (1u << channel)) != 0u);
+}
+
+/* Force the receive pad to input before muxing it to TRGM: a pad that was an
+ * output keeps driving the net otherwise.
+ */
+static void bd_rx_pad_input(unsigned pin)
+{
+	HPM_GPIO0->OE[GPIO_DI_GPIOE].VALUE &= ~(1u << pin);
+	HPM_IOC->PAD[IOC_PAD_PE08 + pin - 8u].FUNC_CTL = IOC_PAD_FUNC_CTL_ALT_SELECT_SET(17);
+	/* keep the pull-down: the line is idle low, a floating input produces
+	 * junk capture events right after the counter starts
+	 */
+	HPM_IOC->PAD[IOC_PAD_PE08 + pin - 8u].PAD_CTL =
+		IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(0);
+}
+
+static void bd_rx_dma_reset(unsigned index)
+{
+	const bd_rx_ch_t *r = &bd_rx_ch[index];
+
+	dma_disable_channel(HPM_XDMA, r->dma_ch);
+	dma_abort_channel(HPM_XDMA, 1u << r->dma_ch);
+
+	for (unsigned i = 0; i < 100000u; i++) {
+		if ((HPM_XDMA->CHEN & (1u << r->dma_ch)) == 0u) {
+			break;
+		}
+	}
+
+	/* Only the abort above resets the internal transfer counter and the
+	 * destination pointer; writing CTRL = 0 does not.
+	 */
+	HPM_XDMA->CHCTRL[r->dma_ch].CTRL = 0;
+	dma_clear_transfer_status(HPM_XDMA, r->dma_ch);
+}
+
+static void bd_rx_dma_config(unsigned index)
+{
+	const bd_rx_ch_t *r = &bd_rx_ch[index];
+	dma_channel_config_t conf;
+
+	dma_default_channel_config(HPM_XDMA, &conf);
+	conf.src_addr = (uint32_t)&bd_rx_gptmr(r)->CHANNEL[r->ch].CAPPRD;
+	conf.dst_addr = (uint32_t)bd_rx_buf[index];
+	conf.src_mode = DMA_HANDSHAKE_MODE_HANDSHAKE;
+	conf.dst_mode = DMA_HANDSHAKE_MODE_NORMAL;
+	conf.src_width = DMA_TRANSFER_WIDTH_DOUBLE_WORD;
+	conf.dst_width = DMA_TRANSFER_WIDTH_DOUBLE_WORD;
+	conf.src_addr_ctrl = DMA_ADDRESS_CONTROL_FIXED;
+	conf.dst_addr_ctrl = DMA_ADDRESS_CONTROL_INCREMENT;
+	conf.src_burst_size = DMA_NUM_TRANSFER_PER_BURST_1T;
+	conf.size_in_byte = BD_RX_EVENTS * 2u * sizeof(uint32_t);
+	conf.interrupt_mask = DMA_INTERRUPT_MASK_ALL & ~DMA_INTERRUPT_MASK_TERMINAL_COUNT;
+
+	if (dma_setup_channel(HPM_XDMA, r->dma_ch, &conf, false) != status_success) {
+		return;
+	}
+
+	dmamux_config(HPM_DMAMUX, DMA_SOC_CHN_TO_DMAMUX_CHN(HPM_XDMA, r->dma_ch), r->dma_src, true);
+}
+
+int up_bdshot_rx_init(uint32_t mask)
+{
+	mask &= (1u << BD_RX_CHANNELS) - 1u;
+
+	if (mask == 0u) {
+		mask = 0x1u;
+	}
+
+	if (mask == bd_rx_mask) {
+		return OK;
+	}
+
+	if (bd_rx_mask != 0u) {
+		up_bdshot_rx_deinit();
+	}
 
 	clock_add_to_group(clock_gptmr0, 0);
+	clock_add_to_group(clock_gptmr1, 0);
 	clock_add_to_group(clock_xdma, 0);
 
-	dshot_rx_pad_input();
-
-	trgm_filter_t filter = {};
-	filter.mode = trgm_filter_mode_rapid_change;
-	filter.filter_length = 8;
-	trgm_filter_config(HPM_TRGM0, pin, &filter);
-
-	trgm_output_t out = {};
-	out.input = HPM_TRGM0_INPUT_SRC_TRGM0_P00 + pin;
-	out.type = trgm_output_same_as_input;
-	out.invert = false;
-	trgm_output_config(HPM_TRGM0, HPM_TRGM0_OUTPUT_SRC_GPTMR0_IN3, &out);
-
-	/* Measure mode: the timer computes period and width itself. */
-	gptmr_channel_config_t cfg;
-	gptmr_channel_get_default_config(HPM_GPTMR0, &cfg);
-	cfg.mode = gptmr_work_mode_measure_width;
-	cfg.cmp_initial_polarity_high = false;
-	cfg.dma_request_event = gptmr_dma_request_on_input_signal_toggle;
-	gptmr_channel_enable_dma_request(HPM_GPTMR0, DSHOT_RXD_CHANNEL, false);
-
-	if (gptmr_channel_config(HPM_GPTMR0, DSHOT_RXD_CHANNEL, &cfg, false) != status_success) {
-		return false;
-	}
-
-	dma_channel_config_t conf;
-	dma_default_channel_config(HPM_XDMA, &conf);
-	conf.src_addr = (uint32_t)&HPM_GPTMR0->CHANNEL[DSHOT_RXD_CHANNEL].CAPPRD;
-	conf.dst_addr = (uint32_t)rxd_buf;
-	conf.src_mode = DMA_HANDSHAKE_MODE_HANDSHAKE;
-	conf.dst_mode = DMA_HANDSHAKE_MODE_NORMAL;
-	conf.src_width = DMA_TRANSFER_WIDTH_DOUBLE_WORD;
-	conf.dst_width = DMA_TRANSFER_WIDTH_DOUBLE_WORD;
-	conf.src_addr_ctrl = DMA_ADDRESS_CONTROL_FIXED;
-	conf.dst_addr_ctrl = DMA_ADDRESS_CONTROL_INCREMENT;
-	conf.src_burst_size = DMA_NUM_TRANSFER_PER_BURST_1T;
-	conf.size_in_byte = DSHOT_RXD_EVENTS * 2u * sizeof(uint32_t);
-	conf.interrupt_mask = DMA_INTERRUPT_MASK_ALL & ~DMA_INTERRUPT_MASK_TERMINAL_COUNT;
-
-	dma_disable_channel(HPM_XDMA, DSHOT_RXD_DMA_CH);
-
-	if (dma_setup_channel(HPM_XDMA, DSHOT_RXD_DMA_CH, &conf, false) != status_success) {
-		return false;
-	}
-
-	dmamux_config(HPM_DMAMUX, DMA_SOC_CHN_TO_DMAMUX_CHN(HPM_XDMA, DSHOT_RXD_DMA_CH),
-		      HPM_DMA_SRC_GPTMR0_3, true);
-
-	gptmr_channel_enable_dma_request(HPM_GPTMR0, DSHOT_RXD_CHANNEL, true);
-
-	rxd_ready = true;
-
-	return true;
-}
-
-void up_dshot_rxd_start(void)
-{
-	if (!rxd_ready) {
-		return;
-	}
-
-	gptmr_channel_reset_count(HPM_GPTMR0, DSHOT_RXD_CHANNEL);
-	gptmr_clear_status(HPM_GPTMR0, GPTMR_CH_CAP_STAT_MASK(DSHOT_RXD_CHANNEL));
-	memset(rxd_buf, 0, sizeof(rxd_buf));
-
-	dma_disable_channel(HPM_XDMA, DSHOT_RXD_DMA_CH);
-	dma_abort_channel(HPM_XDMA, 1u << DSHOT_RXD_DMA_CH);
-
-	for (unsigned i = 0; i < 100000u; i++) {
-		if ((HPM_XDMA->CHEN & (1u << DSHOT_RXD_DMA_CH)) == 0u) {
-			break;
+	for (unsigned index = 0; index < BD_RX_CHANNELS; index++) {
+		if ((mask & (1u << index)) == 0u) {
+			continue;
 		}
+
+		const bd_rx_ch_t *r = &bd_rx_ch[index];
+		GPTMR_Type *gptmr = bd_rx_gptmr(r);
+
+		bd_rx_pad_input(r->pin);
+
+		trgm_filter_t filter = {};
+		filter.mode = trgm_filter_mode_rapid_change;
+		filter.filter_length = 8;
+		trgm_filter_config(HPM_TRGM0, r->pin, &filter);
+
+		trgm_output_t out = {};
+		out.input = HPM_TRGM0_INPUT_SRC_TRGM0_P00 + r->pin;
+		out.type = trgm_output_same_as_input;
+		out.invert = false;
+		trgm_output_config(HPM_TRGM0, r->trgm_out, &out);
+
+		gptmr_channel_config_t cfg;
+		gptmr_channel_get_default_config(gptmr, &cfg);
+		cfg.mode = gptmr_work_mode_measure_width;
+		cfg.cmp_initial_polarity_high = false;
+		cfg.dma_request_event = gptmr_dma_request_on_input_signal_toggle;
+		gptmr_channel_enable_dma_request(gptmr, r->ch, false);
+
+		if (gptmr_channel_config(gptmr, r->ch, &cfg, false) != status_success) {
+			up_bdshot_rx_deinit();
+			return -EIO;
+		}
+
+		bd_rx_dma_reset(index);
+		bd_rx_dma_config(index);
+		gptmr_channel_enable_dma_request(gptmr, r->ch, true);
 	}
 
-	HPM_XDMA->CHCTRL[DSHOT_RXD_DMA_CH].CTRL = 0;
-	dma_clear_transfer_status(HPM_XDMA, DSHOT_RXD_DMA_CH);
+	bd_rx_mask = (uint8_t)mask;
 
-	dma_channel_config_t conf;
-	dma_default_channel_config(HPM_XDMA, &conf);
-	conf.src_addr = (uint32_t)&HPM_GPTMR0->CHANNEL[DSHOT_RXD_CHANNEL].CAPPRD;
-	conf.dst_addr = (uint32_t)rxd_buf;
-	conf.src_mode = DMA_HANDSHAKE_MODE_HANDSHAKE;
-	conf.dst_mode = DMA_HANDSHAKE_MODE_NORMAL;
-	conf.src_width = DMA_TRANSFER_WIDTH_DOUBLE_WORD;
-	conf.dst_width = DMA_TRANSFER_WIDTH_DOUBLE_WORD;
-	conf.src_addr_ctrl = DMA_ADDRESS_CONTROL_FIXED;
-	conf.dst_addr_ctrl = DMA_ADDRESS_CONTROL_INCREMENT;
-	conf.src_burst_size = DMA_NUM_TRANSFER_PER_BURST_1T;
-	conf.size_in_byte = DSHOT_RXD_EVENTS * 2u * sizeof(uint32_t);
-	conf.interrupt_mask = DMA_INTERRUPT_MASK_ALL & ~DMA_INTERRUPT_MASK_TERMINAL_COUNT;
+	return OK;
+}
 
-	if (dma_setup_channel(HPM_XDMA, DSHOT_RXD_DMA_CH, &conf, false) != status_success) {
+void up_bdshot_rx_deinit(void)
+{
+	if (bd_rx_mask == 0u) {
 		return;
 	}
 
-	dmamux_config(HPM_DMAMUX, DMA_SOC_CHN_TO_DMAMUX_CHN(HPM_XDMA, DSHOT_RXD_DMA_CH),
-		      HPM_DMA_SRC_GPTMR0_3, true);
+	for (unsigned index = 0; index < BD_RX_CHANNELS; index++) {
+		if ((bd_rx_mask & (1u << index)) == 0u) {
+			continue;
+		}
 
-	dma_enable_channel(HPM_XDMA, DSHOT_RXD_DMA_CH);
-	gptmr_start_counter(HPM_GPTMR0, DSHOT_RXD_CHANNEL);
+		const bd_rx_ch_t *r = &bd_rx_ch[index];
+
+		gptmr_stop_counter(bd_rx_gptmr(r), r->ch);
+		gptmr_channel_enable_dma_request(bd_rx_gptmr(r), r->ch, false);
+		dma_disable_channel(HPM_XDMA, r->dma_ch);
+		dma_abort_channel(HPM_XDMA, 1u << r->dma_ch);
+
+		/* Drop the DMAMUX mapping: the released channel would otherwise
+		 * keep listening on the GPTMR request and starve the next user.
+		 */
+		HPM_DMAMUX->MUXCFG[DMA_SOC_CHN_TO_DMAMUX_CHN(HPM_XDMA, r->dma_ch)] = 0;
+	}
+
+	bd_rx_mask = 0u;
 }
 
-void up_dshot_rxd_flush(void)
+bool up_bdshot_rx_ready(void)
 {
-	/* Drain whatever the arming sequence captured (the line can show a short
-	 * spike right after the timer starts) and restart the XDMA transfer from
-	 * buffer entry 0 while the capture counter keeps running.
+	return bd_rx_mask != 0u;
+}
+
+void up_bdshot_rx_arm(void)
+{
+	for (unsigned index = 0; index < BD_RX_CHANNELS; index++) {
+		if ((bd_rx_mask & (1u << index)) == 0u) {
+			continue;
+		}
+
+		const bd_rx_ch_t *r = &bd_rx_ch[index];
+		GPTMR_Type *gptmr = bd_rx_gptmr(r);
+
+		gptmr_channel_reset_count(gptmr, r->ch);
+		gptmr_clear_status(gptmr, GPTMR_CH_CAP_STAT_MASK(r->ch));
+		memset(bd_rx_buf[index], 0, sizeof(bd_rx_buf[index]));
+
+		bd_rx_dma_reset(index);
+		bd_rx_dma_config(index);
+		dma_enable_channel(HPM_XDMA, r->dma_ch);
+		gptmr_start_counter(gptmr, r->ch);
+	}
+}
+
+void up_bdshot_rx_flush(void)
+{
+	/* The line shows a short spike right after the counter starts; drop
+	 * whatever the arming sequence caught and restart the transfer from the
+	 * first entry while the capture counter keeps running.
 	 */
-	dma_disable_channel(HPM_XDMA, DSHOT_RXD_DMA_CH);
-	dma_abort_channel(HPM_XDMA, 1u << DSHOT_RXD_DMA_CH);
+	for (unsigned index = 0; index < BD_RX_CHANNELS; index++) {
+		if ((bd_rx_mask & (1u << index)) == 0u) {
+			continue;
+		}
 
-	for (unsigned i = 0; i < 100000u; i++) {
-		if ((HPM_XDMA->CHEN & (1u << DSHOT_RXD_DMA_CH)) == 0u) {
-			break;
+		const bd_rx_ch_t *r = &bd_rx_ch[index];
+
+		memset(bd_rx_buf[index], 0, sizeof(bd_rx_buf[index]));
+
+		bd_rx_dma_reset(index);
+		bd_rx_dma_config(index);
+		dma_enable_channel(HPM_XDMA, r->dma_ch);
+	}
+}
+
+void up_bdshot_rx_stop(void)
+{
+	for (unsigned index = 0; index < BD_RX_CHANNELS; index++) {
+		if ((bd_rx_mask & (1u << index)) == 0u) {
+			continue;
+		}
+
+		const bd_rx_ch_t *r = &bd_rx_ch[index];
+
+		gptmr_stop_counter(bd_rx_gptmr(r), r->ch);
+		dma_disable_channel(HPM_XDMA, r->dma_ch);
+		dma_abort_channel(HPM_XDMA, 1u << r->dma_ch);
+	}
+}
+
+const uint32_t *up_bdshot_rx_buffer(uint8_t channel)
+{
+	return bd_rx_channel_valid(channel) ? bd_rx_buf[channel] : NULL;
+}
+
+unsigned up_bdshot_rx_words(void)
+{
+	return BD_RX_EVENTS * 2u;
+}
+
+unsigned up_bdshot_rx_events(uint8_t channel)
+{
+	if (!bd_rx_channel_valid(channel)) {
+		return 0;
+	}
+
+	const uint32_t *buf = bd_rx_buf[channel];
+	unsigned events = 0;
+
+	for (unsigned i = 0; i + 1u < BD_RX_EVENTS * 2u; i += 2u) {
+		if (buf[i] != 0u || buf[i + 1u] != 0u) {
+			events++;
 		}
 	}
 
-	HPM_XDMA->CHCTRL[DSHOT_RXD_DMA_CH].CTRL = 0;
-	dma_clear_transfer_status(HPM_XDMA, DSHOT_RXD_DMA_CH);
-	memset(rxd_buf, 0, sizeof(rxd_buf));
+	return events;
+}
 
-	dma_channel_config_t conf;
-	dma_default_channel_config(HPM_XDMA, &conf);
-	conf.src_addr = (uint32_t)&HPM_GPTMR0->CHANNEL[DSHOT_RXD_CHANNEL].CAPPRD;
-	conf.dst_addr = (uint32_t)rxd_buf;
-	conf.src_mode = DMA_HANDSHAKE_MODE_HANDSHAKE;
-	conf.dst_mode = DMA_HANDSHAKE_MODE_NORMAL;
-	conf.src_width = DMA_TRANSFER_WIDTH_DOUBLE_WORD;
-	conf.dst_width = DMA_TRANSFER_WIDTH_DOUBLE_WORD;
-	conf.src_addr_ctrl = DMA_ADDRESS_CONTROL_FIXED;
-	conf.dst_addr_ctrl = DMA_ADDRESS_CONTROL_INCREMENT;
-	conf.src_burst_size = DMA_NUM_TRANSFER_PER_BURST_1T;
-	conf.size_in_byte = DSHOT_RXD_EVENTS * 2u * sizeof(uint32_t);
-	conf.interrupt_mask = DMA_INTERRUPT_MASK_ALL & ~DMA_INTERRUPT_MASK_TERMINAL_COUNT;
+bool up_bdshot_rx_done(uint8_t channel)
+{
+	/* A frame is 16 pulses and measure mode reports the previous one, so the
+	 * window of a complete frame holds 16 pairs: the stale one from before the
+	 * frame plus 15 measured widths (see up_bdshot_rx_frame()).
+	 */
+	return up_bdshot_rx_events(channel) >= 16u;
+}
 
-	if (dma_setup_channel(HPM_XDMA, DSHOT_RXD_DMA_CH, &conf, false) == status_success) {
-		dmamux_config(HPM_DMAMUX, DMA_SOC_CHN_TO_DMAMUX_CHN(HPM_XDMA, DSHOT_RXD_DMA_CH),
-			      HPM_DMA_SRC_GPTMR0_3, true);
-		dma_enable_channel(HPM_XDMA, DSHOT_RXD_DMA_CH);
+static bool bd_rx_crc_ok(uint16_t frame)
+{
+	const uint16_t packet = frame >> 4;
+	const uint16_t crc = (packet ^ (packet >> 4) ^ (packet >> 8)) & 0x0F;
+
+	return (frame & 0x0F) == crc;
+}
+
+static uint32_t bd_rx_bit_ticks(void)
+{
+	const uint32_t gclk = clock_get_frequency(clock_gptmr0);
+
+	if (gclk == 0u || dshot_bit_hz == 0u) {
+		return 0u;
 	}
-}
-void up_dshot_rxd_stop(void)
-{
-	gptmr_stop_counter(HPM_GPTMR0, DSHOT_RXD_CHANNEL);
-	dma_disable_channel(HPM_XDMA, DSHOT_RXD_DMA_CH);
-	dma_abort_channel(HPM_XDMA, 1u << DSHOT_RXD_DMA_CH);
+
+	return gclk / dshot_bit_hz;
 }
 
-const uint32_t *up_dshot_rxd_buffer(void)
+int up_bdshot_rx_frame(uint8_t channel, uint16_t *frame, unsigned *pairs_out)
 {
-	return rxd_buf;
+	if (frame == NULL) {
+		return -EINVAL;
+	}
+
+	if (!bd_rx_channel_valid(channel)) {
+		return -EINVAL;
+	}
+
+	const uint32_t bit = bd_rx_bit_ticks();
+
+	if (bit == 0u) {
+		return -EINVAL;
+	}
+
+	const uint32_t half = bit / 2u;
+	const uint32_t lo = bit / 4u;           /* a "0" is 37.5 % of a bit time */
+	const uint32_t hi = bit + half;         /* generous upper bound */
+	const uint32_t *buf = bd_rx_buf[channel];
+	uint16_t value = 0;
+	unsigned pairs = 0;
+	unsigned bits = 0;
+
+	for (unsigned i = 0; i + 1u < BD_RX_EVENTS * 2u; i += 2u) {
+		const uint32_t prd = buf[i];
+		const uint32_t dty = buf[i + 1u];
+
+		if (prd == 0u && dty == 0u) {
+			continue;               /* entry the DMA never wrote */
+		}
+
+		pairs++;
+
+		if (pairs == 1u) {
+			/* stale measurement: the pulse that was running when the
+			 * counter started, not part of the frame
+			 */
+			continue;
+		}
+
+		if (dty < lo || dty > hi) {
+			continue;               /* sub-bit glitch on the line */
+		}
+
+		if (bits < 16u) {
+			value = (uint16_t)((value << 1) | ((dty > half) ? 1u : 0u));
+			bits++;
+		}
+	}
+
+	if (pairs_out != NULL) {
+		*pairs_out = pairs;
+	}
+
+	if (bits == 16u && bd_rx_crc_ok(value)) {
+		*frame = value;
+		return OK;
+	}
+
+	if (bits == 15u) {
+		/* The width of the last pulse is latched by the next capture event
+		 * and a frame has no pulse after its own: bit0 is not measured.
+		 * The CRC determines it, so try both values and keep the valid one.
+		 */
+		for (unsigned lsb = 0; lsb < 2u; lsb++) {
+			const uint16_t candidate = (uint16_t)((value << 1) | lsb);
+
+			if (bd_rx_crc_ok(candidate)) {
+				*frame = candidate;
+				return OK;
+			}
+		}
+	}
+
+	return -EAGAIN;
 }
 
-unsigned up_dshot_rxd_words(void)
+int up_bdshot_rx_wait(uint8_t channel, uint32_t timeout_us, uint16_t *frame)
 {
-	return DSHOT_RXD_EVENTS * 2u;
+	const unsigned step_us = 50u;
+	const unsigned polls = timeout_us / step_us + 1u;
+
+	for (unsigned i = 0; i < polls; i++) {
+		const int ret = up_bdshot_rx_frame(channel, frame, NULL);
+
+		if (ret == OK) {
+			return OK;
+		}
+
+		if (ret != -EAGAIN) {
+			return ret;
+		}
+
+		up_udelay(step_us);
+	}
+
+	return -ETIMEDOUT;
 }
+
 /* Bidirectional DShot is not implemented yet; keep the API consistent. */
 int up_bdshot_num_erpm_ready(void) { return 0; }
 int up_bdshot_get_erpm(uint8_t channel, int *erpm) { (void)channel; if (erpm) { *erpm = 0; } return -ENOSYS; }

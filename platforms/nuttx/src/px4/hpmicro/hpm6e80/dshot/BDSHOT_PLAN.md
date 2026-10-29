@@ -1,12 +1,23 @@
 # Bidirectional DShot (BDShot) — implementation plan
 
-Status: **not implemented yet**.  The output direction (DShot frames) is done:
-see `dshot.c` (`up_dshot_init/dshot_motor_data_set/up_dshot_arm/up_dshot_trigger`),
-4 channels on PWM1 (PE08..PE11), 16-bit frame fed by a 16-node linked
-descriptor chain, one DMA burst per bit period.
+Status (final bring-up build): **bring-up done, not integrated**.
+The output direction is verified at 150/300/600 kbit/s: 16 data bits + one idle
+word (17-node linked descriptor chain), 4 channels on PWM1 (PE08..PE11),
+push-pull output, line idle low, frame end detected by polling the DMA channel.
+The receive direction is verified on a PE08 -> PE09 jumper: GPTMR measure mode
++ XDMA pair capture, `gcapxsweep 5` -> 105/105 MATCH.  The production receive
+API (`up_bdshot_rx_*`, declared in `px4_arch/dshot.h`) is in place and replaced
+the experimental `up_dshot_rxd_*` block.  It decodes our own transmitted frame;
+an ESC reply (GCR, eRPM) is not implemented.  Nothing calls the driver yet
+(`CONFIG_DRIVERS_DSHOT` is off, no io_timer / PWM_OUT glue).
 
-This file records everything learned so the receive path can be implemented
-later without re-doing the investigation.
+The sections below are the chronological design and bring-up log, including the
+abandoned experiments (see "Dead-code inventory" for what can be deleted).
+Current status, the resource map, the receive API contract and the open items
+are collected in the sections at the end.
+
+This file records everything learned so the production receive path can be
+completed without re-doing the investigation.
 
 ## What the ESC does
 
@@ -405,3 +416,301 @@ Practical conclusion for BDShot:
 - PWMv2 capture would remove the pin restriction, but its value latch needs more
   investigation (candidate causes: capture counter selection semantics, the
   TRGM trigger interacting with the capture module, or a silicon/SDK quirk).
+
+## Current status (final bring-up build; RX through the production API)
+
+**Transmit: verified.**  The frame scheme changed after the sections above were
+written; this is the current one.
+
+- One frame is 17 words: 16 data bits + one idle word.  The frame buffer is
+  interleaved per motor and one DMA burst writes the duty shadows of all
+  enabled channels; the linked descriptor chain has one node per word.
+- bit15 is preloaded into the duty shadow by `dshot_motor_data_set()`; the
+  channel-control transfer that runs when the DMA channel is enabled consumes
+  chain word 0, so the linked chain starts at descriptor 1 (bit14) and the
+  burst writes bit14..bit0 plus the idle word.  This is why the chain is 17
+  nodes and not 16.
+- "1" is 75 % duty, "0" is 37.5 % (`dshot_cmp()`); `reload = PWM1 clock /
+  bitrate - 1`, so the same code serves 150/300/600 kbit/s.
+- The pad is push-pull while armed: `up_dshot_arm(true)` enables the channel
+  outputs and the frame path never releases the line.  A unidirectional DShot
+  output must drive the wire; the high-Z scheme in the older sections is not
+  used for transmitting.
+- Idle is low, not high-Z: the idle word carries a compare value above the
+  period (`reload + reload/2`), the comparator never matches, no pulse is
+  generated and the counter keeps running.  The next frame is armed by
+  resetting the counter and re-programming the chain.
+- Frame end is detected by polling the DMA channel-enable bit in
+  `up_dshot_frame_done()`; the DMA transfer-complete callback only maintains
+  `tc_count` for the bring-up harness and does not drive the frame sequence.
+  (The TC interrupt is still enabled on the last descriptor - not removed,
+  just unused by the frame path.)
+- `up_dshot_idle()` forces the idle level from thread context; writing the
+  shadows from the DMA TC interrupt deadlocks against the DMA writing the same
+  registers.
+- The independent `pollscan` CPU-sampler check prints MISMATCH (polled 0x030b
+  vs sent 0x830b) by design: it samples the pin without frame phase and is a
+  waveform dump, not a decoder.  Its widths are correct (247/253 ticks =
+  37.5 %/75 % of the 662-tick bit at 150 kbit).  Do not read it as a TX
+  regression.
+
+**Receive: verified against our own frame, not yet against an ESC.**  The
+receiver is GPTMR measure mode + XDMA, one GPTMR capture channel and one XDMA
+channel per motor (implementation in `dshot.c`, prototypes in
+`px4_arch/dshot.h`):
+
+- The receive pad is muxed to TRGM alt function 17, the TRGM filter runs in
+  `rapid_change` mode with length 8, the TRGM input feeds a GPTMR channel in
+  `gptmr_work_mode_measure_width` with
+  `gptmr_dma_request_on_input_signal_toggle`.
+- One XDMA channel moves `(CAPPRD, CAPDTY)` as one double-word transfer per
+  capture event into a 32-event buffer in `.ahb_sram`.
+- Decoding (`up_bdshot_rx_frame()`): skip the first written pair (stale
+  measurement), reject widths outside `bit/4 .. 1.5*bit`, take 16 bits
+  MSB-first ("1" when width > bit/2), check the DShot CRC.
+- Measure mode latches the width of the *previous* pulse, so the last pulse of
+  a frame has no successor edge and only 15 of the 16 widths are ever
+  measured.  The decoder therefore accepts either 16 bits with a valid CRC, or
+  15 bits plus the missing LSB recovered from the CRC (try both values, keep
+  the one that validates).  This is a property of the hardware path, not a
+  workaround; it is why the harness now compares the full 16-bit frame instead
+  of `frame == sent >> (16 - bits)`.  Captured evidence from the earlier build:
+  `recv 0x4185 (15 bits, 16 events) -> MATCH`, and `0x4185 == 0x830b >> 1` -
+  the frame decoded with the last width missing and the LSB taken from the CRC.
+- Measurements on the final build (`gcapx` path through the production API,
+  PE08 -> PE09 jumper; the sweeps transmit on channel 0 only):
+  - `pwmv2test gcapxsweep 5` -> **105/105 MATCH**: 35/35 frames at each of
+    150/300/600 kbit/s, setpoints 0/10/25/50/75/90/100 % (the same 105/105 was
+    already recorded with the earlier inline decoder at f33d3ab926);
+  - `pwmv2test gcapxloop 600 50 300` -> **300 frames, all MATCH**;
+  - `pwmv2test gcapx 300 75` -> **MATCH** (`sent 0xc185 recv 0xc185`); the pair
+    dump shows the stale entry `[0] prd 394849 dty 0` (skipped) followed by
+    widths 250/250/125 against a 333-tick bit, i.e. the 75 %/37.5 % levels;
+  - `pwmv2test gcapxsweep 3` -> **63/63 MATCH** (earlier run of the same
+    build, recorded in the harness console, not in the commit log);
+  - `pwmv2test gcapxtimeout` -> wait returns `-ETIMEDOUT` (-116) with no frame
+    on the wire (617 us wall time for a 500 us timeout), then a normal frame
+    still decodes (`sent 0x830b recv 0x830b`, 66 us).
+- Known residual: the very first frame after a cold boot can be one capture
+  event short.  Every later frame passes, including after re-initialisation.
+
+Not integrated yet: no io_timer / PWM_OUT glue, `CONFIG_DRIVERS_DSHOT` is off,
+GCR decoding and eRPM are not implemented, and the test decodes our own frame
+instead of an ESC reply.
+
+## Resource map (per motor)
+
+Transmit (shared by all motors):
+
+- PWM1 counter 0, one PWM channel per motor on PE08..PE11
+  (`PWM1_P_0..P_3`), duty/edge comparators, one HDMA channel with the 17-node
+  descriptor chain, TRGM DMACFG_1 / `PWM1_REQ1` as request source, buffers and
+  descriptors in `.ahb_sram`.
+
+Receive (one GPTMR capture channel + one XDMA channel per motor).  The current
+implementation is table-driven (`bd_rx_ch[]` in `dshot.c`):
+
+| motor | RX pad (jumper rig) | TRGM input | GPTMR capture | XDMA | DMAMUX source |
+| --- | --- | --- | --- | --- | --- |
+| 0 | PE09 | `TRGM.P[9]` | GPTMR0 CH2 (`GPTMR0_IN2`) | ch0 | `GPTMR0_2` |
+| 1 | PE10 | `TRGM.P[10]` | GPTMR0 CH3 (`GPTMR0_IN3`) | ch1 | `GPTMR0_3` |
+| 2 | PE11 | `TRGM.P[11]` | GPTMR1 CH2 (`GPTMR1_IN2`) | ch2 | `GPTMR1_2` |
+| 3 | PE12 | `TRGM.P[12]` | GPTMR1 CH3 (`GPTMR1_IN3`) | ch3 | `GPTMR1_3` |
+
+GPTMR channels 2 and 3 have no direct pin, which is why their signal comes in
+through TRGM.  The RX pads above are the **jumper rig** used during the
+bring-up: the motor 0 line on PE08 is looped back to PE09, and the other
+receive leads are PE10..PE12.  A real bidirectional ESC answers on its own
+transmit line, so board integration has to repoint the table at the transmit
+pads (PE08..PE11) and switch the pad function around the frame (see "Direction
+switching"); the four rig entries are not the production wiring.  Only channel
+0 (PE08 -> PE09) has been received so far.
+
+Why HDMA (TX) and XDMA (RX) do not contend:
+
+- they are separate DMA controllers (`HPM_HDMA` / `HPM_XDMA`) with separate
+  interrupt vectors (`IRQn_HDMA` / `IRQn_XDMA`), separate DMAMUX entries and
+  separate channel numbers;
+- TX runs its linked chain on an HDMA channel allocated through `dma_mgr`; RX
+  programs an XDMA channel directly with `dma_setup_channel()`;
+- each RX channel has its own GPTMR capture request source (`GPTMR0_2`,
+  `GPTMR0_3`, `GPTMR1_2`, `GPTMR1_3`), so no two channels listen on one request
+  line.  An earlier experiment with two HDMA channels on GPTMR capture requests
+  hung the board (see the dead-code inventory).
+
+## Decision log (facts that used to live only in code comments)
+
+1. **Measure mode has a one-event lag.** `gptmr_work_mode_measure_width`
+   reports the period/width of the pulse that ended *before* the capture
+   event, so the first entry belongs to whatever was on the line when the
+   window opened (a stale measurement) and the last pulse of the frame has no
+   successor edge at all.  Only 15 of the 16 widths can therefore be measured;
+   the decoder skips the stale first entry and recovers the missing LSB from
+   the CRC (see `up_bdshot_rx_frame()`).  This is a property of the hardware
+   path, not a workaround - it is why the harness can compare the full 16-bit
+   frame instead of allowing a missing leading bit.  Console evidence from the
+   earlier build: `recv 0x4185 (15 bits, 16 events) -> MATCH`, with
+   `0x4185 == 0x830b >> 1`.
+
+2. **dty filter window `bit/4 .. 1.5*bit` (inclusive).**  An unwritten entry
+   is `(0,0)` and the line shows ~10 ns spikes at the frame start; both would
+   decode as a spurious "0".  A real pulse is 37.5 % ("0") or 75 % ("1") of a
+   bit period, i.e. `bit*3/8` and `bit*3/4` in GPTMR ticks, so the accepted
+   window keeps both with margin and rejects everything else.
+
+3. **Comparator-own-events rule: only channel-own comparators fire.**  The
+   `DMA_EN` selector accepts the full compare-index range, but a comparator
+   that does not belong to an enabled channel never generates a DMA request.
+   Measured with `pwmv2test cmpdma <out_en> <cmp_index>` at 200 kHz: with
+   channel 0 active, cmp0..cmp2 fire (32/32 words captured); cmp4..cmp14 set
+   `DMA_EN` but produce no request at all (0/32).  This is why the first TX
+   attempt with a dedicated cmp8 trigger never fired; the working TX chain uses
+   compare index 2 with channel 0 enabled.
+
+4. **DMAV2 needs an abort before the channel is re-configured.**  A receive
+   window usually ends before the capture buffer is full (the 48-event chain
+   experiment; the production buffer is 32 events), so the transfer is still
+   active at stop.  Disabling the channel and writing `CHCTRL[x].CTRL = 0`
+   leaves the internal transfer counter and destination pointer untouched; the
+   next arm then resumes inside the old buffer (observed: `TRANSIZE 94,
+   DST base+8` instead of `96, base`) and the decoder reads `(0,0)` at entry 0.
+   The fix is an explicit `dma_abort_channel()` (CHABORT) plus a wait for
+   `CHEN` to clear before re-programming - as in `rxf_channel_reset()` and
+   `bd_rx_dma_reset()`.
+
+5. **DMAMUX `MUXCFG` is write-only.**  `hpm_dmamux_regs.h` marks it `__W`, so a
+   read-back always returns 0 and cannot be used to verify the request routing.
+   The mapping must be written explicitly after every channel setup (see
+   `bd_rx_dma_config()`; the old experiment did the same in
+   `up_dshot_rxd_start/_flush()`) and cleared on deinit: a released channel
+   that keeps its MUXCFG entry stays subscribed to the same request source and
+   starves the next one (seen as zero captured events on re-arm).
+
+6. **RX buffers in `.ahb_sram`.**  Same rule as the TX buffers: DMA-visible
+   memory must be non-cacheable so a window needs no cache maintenance.  All
+   receiver buffers (`bd_rx_buf`, `rxg_buf`, `rxf_buf`, `rxp_buf`, `rxi_buf`,
+   `rx_buf`, capture ring `cap_buf`) are attributed to `.ahb_sram`.
+
+7. **Build: the arch_dshot target needs the HPM platform include dir.**  The
+   receive API is declared in the HPM platform header
+   (`hpm_common/include/px4_arch/dshot.h`), which is not on the arch library
+   include path by default; `CMakeLists.txt` needs
+   `target_include_directories(arch_dshot PRIVATE
+   ${PX4_SOURCE_DIR}/platforms/nuttx/src/px4/hpmicro/hpm_common/include)`
+   or the header is not found.  (Same file also defines
+   `-DHPMSOC_HAS_HPMSDK_DMAV2` for the DMAv2 API.)
+
+## Production receive API contract
+
+The receive path is behind the following API: prototypes in
+`platforms/nuttx/src/px4/hpmicro/hpm_common/include/px4_arch/dshot.h`,
+implementation in `dshot.c` (`bd_rx_*` helpers, table-driven per channel).
+This replaced the experimental `up_dshot_rxd_*` block.
+
+- `up_bdshot_rx_init(mask)` - one-time setup: clocks, receive pads to TRGM
+  (alt 17, pull-down), TRGM filter + route, GPTMR measure mode, XDMA channel
+  config and DMAMUX mapping.  `mask = 0` means channel 0; calling it again
+  with the same mask is a no-op.  Returns OK or a negative errno (`-EIO` if the
+  GPTMR channel cannot be configured).
+- `up_bdshot_rx_deinit()` - stop the counters, disable the capture DMA
+  requests, disable/abort the XDMA channels and clear their DMAMUX mappings.
+  No `dma_mgr` resource is involved: XDMA is programmed directly.
+- `up_bdshot_rx_ready()` - true when the engine is initialised.
+- `up_bdshot_rx_arm()` - clear the buffers, reset the capture count/status,
+  re-arm the XDMA transfer from entry 0 and start the capture counter.
+- `up_bdshot_rx_flush()` - drop what the arming sequence captured (zero the
+  buffer, abort/reset/re-arm the XDMA transfer from entry 0) while the capture
+  counter keeps running.  This is what removes the spike latched right after
+  the counter starts.
+- `up_bdshot_rx_stop()` - stop the capture counter and the XDMA channel
+  (disabled and aborted).
+- `up_bdshot_rx_done(ch)` - true when more than 16 receive events are buffered
+  (a 16-pulse frame plus the stale entry).  A polling hint for callers, not a
+  decode; use `_frame()` for the verdict.
+- `up_bdshot_rx_events(ch)` - number of capture events (written pairs) in the
+  channel buffer.
+- `up_bdshot_rx_buffer(ch)` - raw `(period, width)` word pairs of channel
+  `ch`; NULL for an invalid/unconfigured channel.
+- `up_bdshot_rx_words()` - words per channel buffer: 32 events x 2 words = 64.
+- `up_bdshot_rx_frame(ch, *frame, *pairs)` - decode the completed window:
+  skip the first written pair (stale measurement), filter dty with the
+  `bit/4 .. 1.5*bit` (inclusive) window, assemble 16 bits MSB-first, check the
+  DShot CRC.  Because measure mode never latches the width of the last pulse,
+  only 15 widths may be available: in that case bit0 is recovered from the CRC
+  (both candidate values tried, the one with a valid CRC is kept).  Returns
+  `OK` for a CRC-valid frame, `-EAGAIN` while the frame is incomplete,
+  `-EINVAL` for `frame == NULL`, an invalid channel or an unknown bit rate.
+  `pairs_out` may be NULL.
+- `up_bdshot_rx_wait(ch, timeout_us, *frame)` - poll `_frame()` until a valid
+  frame arrives or `timeout_us` expires (50 us steps); returns `OK`,
+  `-ETIMEDOUT` on timeout, or the `_frame()` error.
+
+`pwmv2test gcapxtimeout` exercises the interrupted-frame path: no frame on the
+wire must return `-ETIMEDOUT`, and the next frame must still decode.
+
+## Dead-code inventory (delete after the port is verified)
+
+Five receive experiments are still compiled into `dshot.c` (PWMv2 capture,
+`rxg`, `rxi`, `rxp`, `rxf`) plus the GPIO port sampler (`rx`).  No production
+code calls any of them; only the matching `pwmv2test` commands do.  The
+old `up_dshot_rxd_*` block has already been removed - it was replaced by the
+production `up_bdshot_rx_*` implementation (previous section), so it is not
+part of the cleanup.
+
+| block | symbols | what it does | tried / result |
+| --- | --- | --- | --- |
+| PWMv2 input capture | `up_dshot_capture_init*`, `_set_counter`, `_enable_edges`, `_enable`, `_reset`, `_count`, `_dropped`, `_get` | PWM1 capture IRQ, ring buffer of (channel, edge, counter) | `captest`, `capdiag`, `capscan`, `gcapisr`: status bits fired but the latch did not refresh per edge (constant pos 90 / neg 7 in our configuration), so the edge timestamps were useless.  Abandoned after the SDK survey showed PWMv2 capture is unused by the SDK. |
+| GPTMR capture + HDMA (`rxg`) | `up_dshot_rxg_*`, `up_dshot_rxcfg` | GPTMR measure mode, one CAPDTY (or CAPPRD) word per event over a per-channel HDMA channel; 4-channel map | `gcap`, `gcapseq`, `gcapm`, `gcapmseq`: measure mode works, but at 600 kbit entries are lost (1/7) and at 150 kbit only 6/7 matched.  Superseded by the single-channel XDMA receiver. |
+| GPIO port sampler (`rx`) | `up_dshot_rx_*` | HDMA samples `GPIO0->DI[E]` at 8 MHz, decodes offline | `rxscan`, `rxscan all`, `rxslow`, `gpiotest`: 8 MHz is 125 ns per sample and DShot pulses are 167 ns..1 us, so the widths are quantised and noisy.  Only useful as a level/release check. |
+| GPTMR both-edge ISR (`rxi`) | `up_dshot_rxi_*` | GPTMR both-edge capture, one ISR timestamp per edge, ring buffer | `gcapisr`: ISR latency loses/misorders edges at 600 kbit (41 ticks = 410 ns between edges).  Kept only as a reference receiver. |
+| GPTMR + HDMA chain (`rxp`) | `up_dshot_rxp_*` | one linked descriptor per event writes the (CAPPOS, CAPNEG) pair | `gcapd`: captures correctly, but a 48-node chain per frame is heavy; replaced by the fixed-burst variant (`rxf`). |
+| GPTMR + HDMA fixed burst (`rxf`) | `up_dshot_rxf_*`, `up_dshot_rxf_state` | one HDMA channel, 2-word `SRC_FIXBURST` reads CAPPOS+CAPNEG per request, decoder pairs the edges | `gcapf`, `gcapfsweep`: 600 kbit 21/21, low rates still lost the first pulse; superseded by the measure-mode receiver, which needs no edge pairing. |
+
+The GPIO sampler block also contains the only `dshot_rx_pins_input/_output`
+helpers (`up_dshot_rx_restore_outputs`); the production receiver uses
+`bd_rx_pad_input()` instead.  The matching `pwmv2test` commands can be deleted
+together with each `dshot.c` block.
+
+### Cleanup checklist (next step)
+
+1. Delete the six dead blocks and their helpers/statics from `dshot.c`:
+   PWMv2 capture (`up_dshot_capture_*`, `cap_*`, `dshot_capture_isr`,
+   `dshot_cap_push`), `rxg` (`up_dshot_rxg_*`, `up_dshot_rxcfg`, `rxg_*`,
+   `dshot_rxg_tc_cb`, `dshot_rxg_pad`), GPIO sampler (`up_dshot_rx_*`,
+   `rx_*`, `dshot_rx_tc_cb`, `dshot_rx_pins_input/_output`), `rxi`
+   (`up_dshot_rxi_*`, `rxi_*`, `dshot_rxi_isr`, `dshot_rxi_push`), `rxp`
+   (`up_dshot_rxp_*`, `rxp_*`, `dshot_rxp_tc_cb`) and `rxf`
+   (`up_dshot_rxf_*`, `rxf_*`, `dshot_rxf_tc_cb`, `rxf_channel_reset`).
+   Delete the receive-only `pwmv2test` commands and their statics in the same
+   change (`captest`, `capdiag`, `capscan`, `gcapisr`, `gcap`, `gcapseq`,
+   `gcapm`, `gcapmseq`, `gcapd`, `gcapf`, `gcapfsweep`, `rxscan`, `rxslow`,
+   `gpiotest`, `bdscap`, `trgmcap`, `gptmrcap`, `rxfstate`).  Keep the TX
+   diagnostics and the production-path commands (`dshot`, `dshotbuf`,
+   `dmadiag`, `pwmregs`, `cmpdma`, `pollscan`, `gcapx`, `gcapxsweep`,
+   `gcapxloop`, `gcapxtimeout`).
+2. Rebuild and check for unused-function / unused-variable warnings; the
+   `MAX_CUSTOM_OPT_LEVEL` build treats them as errors, so the compiler is the
+   proof that nothing else references the deleted blocks.
+3. Re-run `gcapxsweep`, `gcapxtimeout` and `pollscan` to show the production
+   path was not touched by the deletion.
+
+## Open items
+
+- **4-motor receive**: only channel 0 (PE09 receive lead) has been exercised.
+  The implementation already has four table entries (see "Resource map"), but
+  they are the bring-up jumper rig, not production wiring.  For a real ESC the
+  table must point at the transmit pads (PE08..PE11) and the pad function must
+  be switched around the frame: the TX channel output has to be released for
+  the reply window (see "Direction switching").  Neither the four-channel rig
+  (receive leads PE09..PE12) nor the single-wire turnaround has been run.
+- **1200 kbit/s**: untested.  At the 100 MHz GPTMR capture clock that is ~83
+  ticks per bit; the dty window and the one-event lag have to be re-checked.
+- **GCR / eRPM**: not implemented.  The receiver decodes the 16-bit DShot
+  command frame; the ESC reply is GCR 5b/4b with a 4-bit CRC and must be
+  decoded into periods/eRPM before this is bidirectional DShot.
+- **Oscilloscope waveform verification**: pending since the idle-word change.
+  The current bit timing is inferred from the GPTMR capture only.
+- **io_timer / PWM_OUT integration**: `CONFIG_DRIVERS_DSHOT` is still off and
+  nothing calls the driver; the bring-up lives in `pwmv2test`.  Integration must
+  keep the round-robin telemetry model (one ESC reply window per frame) and
+  handle the shared pad (TX push-pull, RX through TRGM).

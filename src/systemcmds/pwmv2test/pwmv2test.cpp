@@ -57,6 +57,7 @@
 #include <px4_platform_common/px4_config.h>
 #include <px4_platform_common/log.h>
 
+#include <errno.h>
 #include <string.h>
 #include <unistd.h>
 #include <drivers/drv_hrt.h>
@@ -2711,19 +2712,23 @@ static int gcapfsweep_run(unsigned runs)
 /* XDMA pair receiver: one (CAPPRD, CAPDTY) 64-bit read per capture event    */
 /* ------------------------------------------------------------------------ */
 
-extern "C" bool up_dshot_rxd_init(void);
-extern "C" void up_dshot_rxd_start(void);
+extern "C" int up_bdshot_rx_init(uint32_t channel_mask);
+extern "C" void up_bdshot_rx_deinit(void);
+extern "C" void up_bdshot_rx_arm(void);
+extern "C" void up_bdshot_rx_flush(void);
+extern "C" void up_bdshot_rx_stop(void);
+extern "C" bool up_bdshot_rx_done(uint8_t channel);
+extern "C" const uint32_t *up_bdshot_rx_buffer(uint8_t channel);
+extern "C" unsigned up_bdshot_rx_words(void);
+extern "C" int up_bdshot_rx_frame(uint8_t channel, uint16_t *frame, unsigned *pairs_out);
+extern "C" int up_bdshot_rx_wait(uint8_t channel, uint32_t timeout_us, uint16_t *frame);
 extern "C" void up_dshot_idle(void);
-extern "C" bool up_dshot_frame_done(void);
-extern "C" void up_dshot_rxd_flush(void);
-extern "C" void up_dshot_rxd_stop(void);
-extern "C" const uint32_t *up_dshot_rxd_buffer(void);
-extern "C" unsigned up_dshot_rxd_words(void);
 
 static bool gcapx_quiet;
 
 static int gcapx_run(unsigned rate_kbit, unsigned throttle_percent)
 {
+	up_bdshot_rx_deinit();
 	up_dshot_deinit();
 
 	if (up_dshot_init(0x1, rate_kbit * 1000u, false) != OK) {
@@ -2731,12 +2736,14 @@ static int gcapx_run(unsigned rate_kbit, unsigned throttle_percent)
 		return 1;
 	}
 
-	if (!up_dshot_rxd_init()) {
-		PX4_ERR("gcapx: capture init failed");
+	if (up_bdshot_rx_init(0x1) != OK) {
+		PX4_ERR("gcapx: rx init failed");
 		return 1;
 	}
 
 	up_dshot_arm(true);
+	up_bdshot_rx_arm();
+	usleep(200);
 
 	uint32_t throttle = 48u + throttle_percent * 2000u / 100u;
 
@@ -2749,76 +2756,36 @@ static int gcapx_run(unsigned rate_kbit, unsigned throttle_percent)
 	const uint16_t sent = (uint16_t)((packet << 4) | crc);
 
 	dshot_motor_data_set(0, (uint16_t)throttle, false);
-	up_dshot_tc_reset();
-	up_dshot_rxd_start();
-	usleep(200);
-	up_dshot_rxd_flush();
+	up_bdshot_rx_flush();
 	usleep(100);
 	up_dshot_trigger();
 
-	uint32_t spin = 0;
+	/* Blocking receive: the decoder filters, assembles and CRC-checks the
+	 * captured window; the harness only compares the returned frame.
+	 */
+	uint16_t frame = 0;
+	const int rc = up_bdshot_rx_wait(0, 5000u, &frame);
 
-	while (spin++ < 2000000u && !up_dshot_frame_done()) {
-	}
-
-	usleep(500);
-	up_dshot_rxd_stop();
+	up_bdshot_rx_stop();
 
 	/* TX stays armed (push-pull) between frames; force the idle low level from
 	 * thread context so the next frame starts from a defined state.
 	 */
 	up_dshot_idle();
 
-	const uint32_t gclk = clock_get_frequency(clock_gptmr0);
-	const uint32_t bit_ticks = gclk / (rate_kbit * 1000u);
-	const uint32_t *buf = up_dshot_rxd_buffer();
-	const unsigned words = up_dshot_rxd_words();
+	const uint32_t *buf = up_bdshot_rx_buffer(0);
+	const unsigned words = up_bdshot_rx_words();
 
-	/* Each entry is (period, width); measure mode reports the PREVIOUS pulse. */
-	uint16_t frame = 0;
-	unsigned bits = 0, events = 0;
-
-	for (unsigned i = 0; i + 1u < words; i += 2u) {
-		const uint32_t prd = buf[i];
-		const uint32_t dty = buf[i + 1u];
-
-		if (prd == 0u && dty == 0u) {
-			/* entries that were never written: skip, do not abort the scan */
-			continue;
-		}
-
-		events++;
-
-		if (events == 1u) {
-			/* stale measurement from before the frame */
-			continue;
-		}
-
-		/* Reject both empty entries and sub-bit glitches (the line shows ~10 ns
-		 * spikes right at the frame start); real bits are 37.5 % or 75 % of a bit.
-		 */
-		if (dty < (bit_ticks / 4u) || dty > (bit_ticks + (bit_ticks / 2u))) {
-			continue;
-		}
-
-		if (bits < 16u) {
-			frame = (uint16_t)((frame << 1) | ((dty > (bit_ticks / 2u)) ? 1u : 0u));
-			bits++;
-		}
-	}
-
-	bool match = false;
+	const bool match = (rc == OK) && (frame == sent);
 
 	if (!gcapx_quiet) {
-		PX4_INFO("gcapx: %u kbit/s, thr %u, sent 0x%04x recv 0x%04x (%u bits, %u events) -> %s",
-		 rate_kbit, (unsigned)throttle, (unsigned)sent, (unsigned)frame, bits, events,
-		 (bits >= 15u && frame == (uint16_t)(sent >> (16u - bits))) ? "MATCH" : "MISMATCH");
+		PX4_INFO("gcapx: %u kbit/s, thr %u, sent 0x%04x recv 0x%04x (rc %d) -> %s",
+		 rate_kbit, (unsigned)throttle, (unsigned)sent, (unsigned)frame, rc,
+		 match ? "MATCH" : "MISMATCH");
 	}
 
-	match = (bits >= 15u) && (frame == (uint16_t)(sent >> (16u - bits)));
-
 	if (!match) {
-		PX4_INFO("gcapx: FAILED frame, full pair dump:");
+		PX4_INFO("gcapx: FAILED frame (rc %d), full pair dump:", rc);
 
 		for (unsigned i = 0; i + 1u < words; i += 2u) {
 			PX4_INFO("gcapx: [%2u] prd %6u dty %6u", i / 2u, (unsigned)buf[i], (unsigned)buf[i + 1u]);
@@ -2893,6 +2860,81 @@ static int gcapxloop_run(unsigned rate_kbit, unsigned throttle_percent, unsigned
 
 	return 0;
 }
+/* ------------------------------------------------------------------------ */
+/* Interrupted frame: the blocking receive must time out, then recover       */
+/* ------------------------------------------------------------------------ */
+
+static int gcapxtimeout_run(void)
+{
+	const unsigned rate_kbit = 600u;
+	const uint32_t timeout_us = 500u;
+	const uint32_t frame_timeout_us = 5000u;
+	int failures = 0;
+
+	up_bdshot_rx_deinit();
+	up_dshot_deinit();
+
+	if (up_dshot_init(0x1, rate_kbit * 1000u, false) != OK) {
+		PX4_ERR("gcapxtimeout: dshot init failed");
+		return 1;
+	}
+
+	if (up_bdshot_rx_init(0x1) != OK) {
+		PX4_ERR("gcapxtimeout: rx init failed");
+		return 1;
+	}
+
+	up_dshot_arm(true);
+	up_bdshot_rx_arm();
+	usleep(200);
+	up_bdshot_rx_flush();
+	usleep(100);
+
+	/* Case 1: nothing on the wire.  The TX API has no way to arm a partial DMA
+	 * chain, so the interrupted frame is represented by the absence of a frame:
+	 * the blocking wait must return -ETIMEDOUT instead of hanging.
+	 */
+	uint16_t frame = 0;
+	hrt_abstime t0 = hrt_absolute_time();
+	const int rc_timeout = up_bdshot_rx_wait(0, timeout_us, &frame);
+	const uint32_t us_timeout = (uint32_t)hrt_elapsed_time(&t0);
+	const bool timeout_ok = (rc_timeout == -ETIMEDOUT) && (us_timeout >= (timeout_us / 2u));
+	PX4_INFO("gcapxtimeout: no frame: wait rc %d after %u us (expect -ETIMEDOUT) -> %s",
+		 rc_timeout, (unsigned)us_timeout, timeout_ok ? "OK" : "FAIL");
+
+	if (!timeout_ok) {
+		failures++;
+	}
+
+	/* Case 2: the receiver must still accept a normal frame after the timeout. */
+	const uint16_t throttle = 1048u;
+	const uint16_t packet = (uint16_t)((throttle << 1) & 0xFFFFu);
+	const uint16_t crc = (packet ^ (packet >> 4) ^ (packet >> 8)) & 0x0F;
+	const uint16_t sent = (uint16_t)((packet << 4) | crc);
+
+	up_bdshot_rx_flush();
+	usleep(100);
+	dshot_motor_data_set(0, throttle, false);
+	up_dshot_trigger();
+
+	frame = 0;
+	t0 = hrt_absolute_time();
+	const int rc_frame = up_bdshot_rx_wait(0, frame_timeout_us, &frame);
+	const uint32_t us_frame = (uint32_t)hrt_elapsed_time(&t0);
+	const bool frame_ok = (rc_frame == OK) && (frame == sent);
+	PX4_INFO("gcapxtimeout: recovery frame: wait rc %d, sent 0x%04x recv 0x%04x after %u us -> %s",
+		 rc_frame, (unsigned)sent, (unsigned)frame, (unsigned)us_frame, frame_ok ? "OK" : "FAIL");
+
+	if (!frame_ok) {
+		failures++;
+	}
+
+	up_bdshot_rx_stop();
+	up_bdshot_rx_deinit();
+	up_dshot_idle();
+
+	return (failures == 0) ? 0 : 1;
+}
 extern "C" int pwmv2test_main(int argc, char *argv[])
 {
 	uint32_t frequency = 1000;
@@ -2930,6 +2972,10 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 
 	if (argc > 1 && strcmp(argv[1], "gcapxsweep") == 0) {
 		return gcapxsweep_run((argc > 2) ? strtoul(argv[2], nullptr, 0) : 3u);
+	}
+
+	if (argc > 1 && strcmp(argv[1], "gcapxtimeout") == 0) {
+		return gcapxtimeout_run();
 	}
 
 	if (argc > 1 && strcmp(argv[1], "gcapx") == 0) {
