@@ -205,6 +205,15 @@ CONFIG_HPM_I2C1=y
 CONFIG_HPM_I2C1_MASTER=y
 # CONFIG_HPM_I2C1_DMA is not set
 
+# The EEPROM is the only persistent storage on this board: PX4 puts the
+# parameters and the calibration data on it through its own at24cxx MTD driver
+# (platforms/nuttx/src/px4/common/px4_24xxxx_mtd.c).  That driver reads the
+# CONFIG_AT24XX_SIZE/ADDR values, which NuttX only exports when MTD_AT24XX is
+# enabled; the NuttX driver itself is then compiled but never instantiated.
+CONFIG_MTD_AT24XX=y
+CONFIG_AT24XX_SIZE=128
+CONFIG_AT24XX_ADDR=0x50
+
 # SPI: SPI7 is the only SPI routed on the HPM6E00EVK (PF26/28/29)
 CONFIG_SPI=y
 CONFIG_SPI_DRIVER=y
