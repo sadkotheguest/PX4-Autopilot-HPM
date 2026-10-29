@@ -183,6 +183,8 @@ add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/apps/libapps.a
 	COMMAND make --no-print-directory --silent TOPDIR=${NUTTX_DIR_MAKE}
 	COMMAND ${CMAKE_COMMAND} -E copy_if_different ${APPS_DIR}/libapps.a ${CMAKE_CURRENT_BINARY_DIR}/apps/libapps.a
 	DEPENDS ${nuttx_apps_files} nuttx_context ${NUTTX_DIR}/include/nuttx/config.h
+		${CMAKE_CURRENT_BINARY_DIR}/px4.bdat
+		${CMAKE_CURRENT_BINARY_DIR}/px4.pdat
 	WORKING_DIRECTORY ${APPS_DIR}
 	#USES_TERMINAL
 )

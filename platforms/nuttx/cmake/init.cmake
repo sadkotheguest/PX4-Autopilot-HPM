@@ -100,6 +100,16 @@ endif()
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${NUTTX_DIR}/defconfig)
 
 execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different ${NUTTX_DIR}/.config ${PX4_BINARY_DIR}/NuttX/nuttx/.config)
+# The template copied above is only needed by the olddefconfig step.  The
+# build-time copy of the configured Make.defs lives in the NuttX context rule,
+# which only runs when config.h is regenerated; without this restore a
+# configure-only run leaves the template behind and every make invocation then
+# sees an empty CC/AR ("make: rcs: No such file or directory").
+if(EXISTS ${PX4_BINARY_DIR}/NuttX/nuttx/Make.defs)
+	execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different
+		${PX4_BINARY_DIR}/NuttX/nuttx/Make.defs ${NUTTX_DIR}/Make.defs)
+endif()
+
 
 ###############################################################################
 # NuttX cmake defconfig
