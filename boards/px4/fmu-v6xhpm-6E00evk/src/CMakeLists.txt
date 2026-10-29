@@ -33,6 +33,7 @@
 
 px4_add_library(drivers_board
 	init.c
+	led.c
 	bringup_stubs.cpp
 	i2c.cpp
 	mtd.cpp

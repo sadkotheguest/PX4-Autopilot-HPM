@@ -102,9 +102,6 @@
  * CONFIG_ARCH_LEDS configuration switch.
  */
 __BEGIN_DECLS
-extern void led_init(void);
-extern void led_on(int led);
-extern void led_off(int led);
 
 extern uint8_t __vector_ram_start__[], __vector_ram_end__[], __vector_load_addr__[];
 extern uint8_t __bss_start__[], __bss_end__[];
@@ -363,7 +360,7 @@ static int board_sdram_selftest(uintptr_t base, size_t size)
 	}
 
 	/* initial LED state */
-	// drv_led_start();
+	drv_led_start();
 
 	// led_off(LED_RED);
 	// led_off(LED_GREEN);
