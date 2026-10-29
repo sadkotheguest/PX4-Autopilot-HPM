@@ -792,6 +792,7 @@ extern "C" void up_bdshot_rx_stop(void);
 extern "C" bool up_bdshot_rx_done(uint8_t channel);
 extern "C" const uint32_t *up_bdshot_rx_buffer(uint8_t channel);
 extern "C" unsigned up_bdshot_rx_words(void);
+extern "C" unsigned up_bdshot_rx_events(uint8_t channel);
 extern "C" int up_bdshot_rx_frame(uint8_t channel, uint16_t *frame, unsigned *pairs_out);
 extern "C" int up_bdshot_rx_wait(uint8_t channel, uint32_t timeout_us, uint16_t *frame);
 extern "C" void up_dshot_idle(void);
@@ -1007,6 +1008,243 @@ static int gcapxtimeout_run(void)
 
 	return (failures == 0) ? 0 : 1;
 }
+/* ------------------------------------------------------------------------ */
+/* Rare-event diagnostic: per-frame capture-event count and raw registers    */
+/* ------------------------------------------------------------------------ */
+
+struct gcapxev_pwm_regs {
+	uint32_t work1;
+	uint32_t reload_w;
+	uint32_t cmpval_w;
+	uint32_t cnt_w;
+	uint32_t shadow20;
+	uint32_t cmp0cfg;
+};
+
+static void gcapxev_read_pwm_regs(gcapxev_pwm_regs *regs)
+{
+	regs->work1 = PWM_BASE->WORK_CTRL1;
+	regs->reload_w = PWM_BASE->CNT_RELOAD_WORK[0];
+	regs->cmpval_w = PWM_BASE->CMP_VAL_WORK[0];
+	regs->cnt_w = PWM_BASE->CNT_VAL[0];
+	regs->shadow20 = PWM_BASE->SHADOW_VAL[PWMV2_SHADOW_INDEX(20)];
+	regs->cmp0cfg = PWM_BASE->CMP[0].CFG;
+}
+
+static void gcapxev_print_pwm_regs(const char *when, unsigned idx, const gcapxev_pwm_regs *regs)
+{
+	PX4_INFO("gcapxev: regs %s f%u WORK1 0x%08x RELOAD_W 0x%08x CMPVAL_W 0x%08x CNT_W 0x%08x SHADOW20 0x%08x CMP0CFG 0x%08x",
+		 when, idx, (unsigned)regs->work1, (unsigned)regs->reload_w, (unsigned)regs->cmpval_w,
+		 (unsigned)regs->cnt_w, (unsigned)regs->shadow20, (unsigned)regs->cmp0cfg);
+}
+
+/* One full receive frame in the gcapx_run() sequence.  Snapshots the PWM
+ * working registers right after the trigger and right after the receive stop;
+ * "print_now" prints them immediately (first frames), otherwise the caller can
+ * print the snapshots later (first anomaly, where the count is only known
+ * after the frame).  Returns -1 if the TX/RX init failed (already reported).
+ */
+static int gcapxev_frame(unsigned rate_kbit, uint32_t throttle, unsigned idx, bool print_now,
+			 gcapxev_pwm_regs *regs_trigger, gcapxev_pwm_regs *regs_stop,
+			 uint16_t *frame_out, unsigned *events_out)
+{
+	up_bdshot_rx_deinit();
+	up_dshot_deinit();
+
+	if (up_dshot_init(0x1, rate_kbit * 1000u, false) != OK) {
+		PX4_ERR("gcapxev: dshot init failed");
+		return -1;
+	}
+
+	if (up_bdshot_rx_init(0x1) != OK) {
+		PX4_ERR("gcapxev: rx init failed");
+		return -1;
+	}
+
+	up_dshot_arm(true);
+	up_bdshot_rx_arm();
+	usleep(200);
+
+	dshot_motor_data_set(0, (uint16_t)throttle, false);
+	up_bdshot_rx_flush();
+	usleep(100);
+	up_dshot_trigger();
+
+	if (regs_trigger != nullptr) {
+		gcapxev_read_pwm_regs(regs_trigger);
+
+		if (print_now) {
+			gcapxev_print_pwm_regs("after trigger", idx, regs_trigger);
+		}
+	}
+
+	uint16_t frame = 0;
+	const int rc = up_bdshot_rx_wait(0, 5000u, &frame);
+
+	up_bdshot_rx_stop();
+
+	if (regs_stop != nullptr) {
+		gcapxev_read_pwm_regs(regs_stop);
+
+		if (print_now) {
+			gcapxev_print_pwm_regs("after stop", idx, regs_stop);
+		}
+	}
+
+	up_dshot_idle();
+
+	if (frame_out != nullptr) {
+		*frame_out = frame;
+	}
+
+	if (events_out != nullptr) {
+		*events_out = up_bdshot_rx_events(0);
+	}
+
+	return rc;
+}
+static int gcapxev_run(unsigned rate_kbit, unsigned throttle_percent, unsigned count, unsigned warmup_kbit)
+{
+	const unsigned expected_events = 16u;
+
+	if (rate_kbit != 150 && rate_kbit != 300 && rate_kbit != 600) {
+		PX4_ERR("usage: pwmv2test gcapxev [150|300|600] [throttle_pct] [count] [warmup_kbit]");
+		return 1;
+	}
+
+	if (warmup_kbit != 0u && warmup_kbit != 150u && warmup_kbit != 300u && warmup_kbit != 600u) {
+		PX4_ERR("gcapxev: warmup_kbit must be 0, 150, 300 or 600");
+		return 1;
+	}
+
+	if (throttle_percent > 100 || count == 0) {
+		PX4_ERR("usage: pwmv2test gcapxev [150|300|600] [throttle_pct] [count] [warmup_kbit]");
+		return 1;
+	}
+
+	const uint32_t gclk = clock_get_frequency(clock_gptmr0);
+	const uint32_t bit_ticks = (gclk != 0u) ? (gclk / (rate_kbit * 1000u)) : 0u;
+	const uint32_t prd_lo = bit_ticks - (bit_ticks / 10u);
+	const uint32_t prd_hi = bit_ticks + (bit_ticks / 10u);
+
+	uint32_t throttle = 48u + throttle_percent * 2000u / 100u;
+
+	if (throttle > 2047u) {
+		throttle = 2047u;
+	}
+
+	const uint16_t packet = (uint16_t)((throttle << 1) & 0xFFFFu);
+	const uint16_t crc = (packet ^ (packet >> 4) ^ (packet >> 8)) & 0x0F;
+	const uint16_t sent = (uint16_t)((packet << 4) | crc);
+
+	unsigned histogram[5] = {};     /* event counts 13, 14, 15, 16, 17 */
+	unsigned hist_other = 0;
+	unsigned anomalies = 0, decode_failures = 0;
+	bool dumped = false;
+
+	for (unsigned i = 0; i < count; i++) {
+		/* Warmup frame at the other rate: every printed frame then has the
+		 * "first frame after a transmit rate change" configuration.
+		 */
+		if (warmup_kbit != 0u) {
+			(void)gcapxev_frame(warmup_kbit, throttle, i, false, nullptr, nullptr, nullptr, nullptr);
+		}
+
+		gcapxev_pwm_regs regs_trigger = {}, regs_stop = {};
+		uint16_t frame = 0;
+		unsigned events = 0;
+		const bool print_regs = (i <= 1u);
+		const int rc = gcapxev_frame(rate_kbit, throttle, i, print_regs,
+					     &regs_trigger, &regs_stop, &frame, &events);
+
+		if (rc == -1) {
+			return 1;       /* TX/RX init failed, already reported */
+		}
+
+		const uint32_t *buf = up_bdshot_rx_buffer(0);
+		const unsigned words = up_bdshot_rx_words();
+
+		/* Period statistics: pairs with prd inside +-10 % of one bit period. */
+		unsigned prd_in = 0, prd_out = 0;
+
+		for (unsigned p = 0; p + 1u < words; p += 2u) {
+			if (buf[p] == 0u && buf[p + 1u] == 0u) {
+				continue;
+			}
+
+			if (buf[p] >= prd_lo && buf[p] <= prd_hi) {
+				prd_in++;
+
+			} else {
+				prd_out++;
+			}
+		}
+
+		const bool match = (rc == OK) && (frame == sent);
+
+		PX4_INFO("gcapxev: %3u %3u kbit thr %4u ev %2u rc %4d recv 0x%04x sent 0x%04x prd_in %2u prd_out %2u %s",
+			 i, rate_kbit, (unsigned)throttle, events, rc, (unsigned)frame, (unsigned)sent,
+			 prd_in, prd_out, match ? "MATCH" : "MISMATCH");
+
+		if (!match) {
+			decode_failures++;
+		}
+
+		if (events >= 13u && events <= 17u) {
+			histogram[events - 13u]++;
+
+		} else {
+			hist_other++;
+		}
+
+		if (events != expected_events) {
+			anomalies++;
+
+			if (!dumped) {
+				dumped = true;
+
+				PX4_INFO("gcapxev: ANOMALY at frame %u: ev %u (expected %u), full pair dump:",
+					 i, events, expected_events);
+
+				for (unsigned p = 0; p + 1u < words; p += 2u) {
+					PX4_INFO("gcapxev: [%2u] prd %6u dty %6u", p / 2u,
+						 (unsigned)buf[p], (unsigned)buf[p + 1u]);
+				}
+
+				const uint32_t sr = gptmr_get_status(HPM_GPTMR0);
+
+				PX4_INFO("gcapxev: GPTMR0_CH3 CNT 0x%08x CAPPRD 0x%08x CAPDTY 0x%08x CAPPOS 0x%08x CAPNEG 0x%08x CR 0x%08x",
+					 (unsigned)HPM_GPTMR0->CHANNEL[3].CNT,
+					 (unsigned)HPM_GPTMR0->CHANNEL[3].CAPPRD,
+					 (unsigned)HPM_GPTMR0->CHANNEL[3].CAPDTY,
+					 (unsigned)HPM_GPTMR0->CHANNEL[3].CAPPOS,
+					 (unsigned)HPM_GPTMR0->CHANNEL[3].CAPNEG,
+					 (unsigned)HPM_GPTMR0->CHANNEL[3].CR);
+				PX4_INFO("gcapxev: GPTMR0 SR 0x%08x (ch3 CAP_STAT %u)",
+					 (unsigned)sr, (unsigned)(((sr & GPTMR_CH_CAP_STAT_MASK(3)) != 0u) ? 1u : 0u));
+				PX4_INFO("gcapxev: PWM1 SHADOW20 0x%08x CMP0_CFG 0x%08x",
+					 (unsigned)HPM_PWM1->SHADOW_VAL[PWMV2_SHADOW_INDEX(20)],
+					 (unsigned)HPM_PWM1->CMP[0].CFG);
+
+				/* For the first anomaly at frame >= 2 the two snapshots were
+				 * taken at the right moments but not printed then (anomaly is
+				 * only known after the frame); print them now.
+				 */
+				if (i > 1u) {
+					gcapxev_print_pwm_regs("after trigger", i, &regs_trigger);
+					gcapxev_print_pwm_regs("after stop", i, &regs_stop);
+				}
+			}
+		}
+	}
+
+	PX4_INFO("gcapxev: %u frames, %u event anomalies, %u decode failures, %u matches",
+		 count, anomalies, decode_failures, count - decode_failures);
+	PX4_INFO("gcapxev: events histogram e13=%u e14=%u e15=%u e16=%u e17=%u other=%u",
+		 histogram[0], histogram[1], histogram[2], histogram[3], histogram[4], hist_other);
+
+	return (anomalies == 0u && decode_failures == 0u) ? 0 : 1;
+}
 extern "C" int pwmv2test_main(int argc, char *argv[])
 {
 	uint32_t frequency = 1000;
@@ -1036,6 +1274,15 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 
 	if (argc > 1 && strcmp(argv[1], "gcapxtimeout") == 0) {
 		return gcapxtimeout_run();
+	}
+
+	if (argc > 1 && strcmp(argv[1], "gcapxev") == 0) {
+		const unsigned rate = (argc > 2) ? strtoul(argv[2], nullptr, 0) : 150u;
+		const unsigned thr = (argc > 3) ? strtoul(argv[3], nullptr, 0) : 0u;
+		const unsigned count = (argc > 4) ? strtoul(argv[4], nullptr, 0) : 100u;
+		const unsigned warmup = (argc > 5) ? strtoul(argv[5], nullptr, 0) : 0u;
+
+		return gcapxev_run(rate, thr, count, warmup);
 	}
 
 	if (argc > 1 && strcmp(argv[1], "gcapx") == 0) {

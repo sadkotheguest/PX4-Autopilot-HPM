@@ -729,3 +729,53 @@ Commands kept: `dshot`, `dshotbuf`, `dmadiag`, `pwmregs`, `cmpdma`,
   nothing calls the driver; the bring-up lives in `pwmv2test`.  Integration must
   keep the round-robin telemetry model (one ESC reply window per frame) and
   handle the shared pad (TX push-pull, RX through TRGM).
+
+## Open bug: bit15 is dropped on the first frame after a slower-rate switch
+
+Found while chasing the "one frame in a hundred at 150 kbit/s" residual.  It is
+a transmit bug, not a capture or decoder bug, and it is deterministic:
+
+- `pwmv2test gcapxev 150 50 5 600` (frames at 150 kbit/s, one silent 600 kbit/s
+  warm-up frame before every printed one) fails 5/5.  With the old commands:
+  alternating `gcapx 600 0` / `gcapx 150 0` failed 15/15 on the 150 kbit/s frame,
+  while `gcapx 150 0` back to back passed 15/15.
+- Direction matters (`gcapxev <rate> 50 2 <warmup>` matrix): 150 after 300
+  fails, 300 after 600 fails, 150 after 600 fails; 300 after 150 passes, 600
+  after 150 passes, 600 after 600 passes.  Rule: switching to a *slower* rate
+  (new reload larger) drops the first pulse, switching to a faster rate is fine.
+- The independent CPU sampler (`pollscan 150 50`, no GPTMR/XDMA involved) run
+  right after a 600 kbit/s frame decodes 15 bits / 30 edges instead of 16 / 32,
+  and the GPTMR capture then starts at b14: the wire has no bit15 pulse at all.
+  Everything after it is aligned (14 widths = b14..b1; the last width is the
+  usual measure-mode lag), so this is a missing first pulse, not a shift and not
+  a decoder problem.
+
+What was tried and ruled out (both reverted, no library change kept):
+
+1. Writing bit15's real comparator value into the duty shadow and latching it
+   while the counter is stopped (and stopping the counter at re-arm): no effect,
+   still 5/5 failures.  The `on_reload` comparator does not take its value from
+   the shadow-lock event.
+2. Waiting for the DMA channel-control transfer of word 0 (bit15) to land in the
+   shadow (poll `SHADOW_VAL[20]` until it equals `frame_buf[0]`) before starting
+   the counter: no effect either, still 5/5.
+
+What the register snapshots say (`gcapxev` prints WORK_CTRL1, CNT_RELOAD_WORK[0],
+CMP_VAL_WORK[0], CNT_VAL[0], SHADOW_VAL[20], CMP[0].CFG right after trigger and
+right after stop): `CNT_RELOAD_WORK[0]` is correct in both cases
+(0x53400 = 1332 ticks = 200 MHz / 150 kHz), so the new period is programmed
+before the frame starts.  The working duty value read immediately after
+`up_dshot_trigger()` differs: 1998 (the 150 kbit/s idle value) in the working
+case, 498 (the 600 kbit/s idle value) in the failing case - the comparator
+working register still carries the previous rate's idle value, i.e. the first
+latch after the start does not pick up word 0 when the rate went down.
+
+Working hypothesis (not proven): bit15 is played from whatever the comparator
+latches at the first reload after the counter starts, so the channel-control
+transfer of word 0 has to win that race.  It wins in steady state and after a
+switch to a faster rate, but not after a switch to a slower rate.  The next step
+is to make the first period deterministic instead of racing: either force a
+reload event after the word-0 write and read back that the working comparator
+carries it, or start the chain at word 1 and give period 0 a deliberately
+programmed value.  `gcapxev` stays in `pwmv2test` because it reproduces this on
+demand.
