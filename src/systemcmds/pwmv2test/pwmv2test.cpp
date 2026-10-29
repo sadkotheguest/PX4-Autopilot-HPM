@@ -1249,6 +1249,300 @@ static int gcapxev_run(unsigned rate_kbit, unsigned throttle_percent, unsigned c
 
 	return (anomalies == 0u && decode_failures == 0u) ? 0 : 1;
 }
+/* ------------------------------------------------------------------------ */
+/* Real-time detector for the rare extra capture event (TX vs RX decision)   */
+/* ------------------------------------------------------------------------ */
+
+static inline uint32_t gcapxdet_cycles(void)
+{
+	uint32_t v = 0;
+	__asm volatile("csrr %0, mcycle" : "=r"(v));
+	return v;
+}
+
+/* Live count of capture events already written by the XDMA: it advances the
+ * destination pointer by 8 bytes per (period, width) pair, so this is valid
+ * while the frame is still arriving - that is what makes the detection happen
+ * at the event instead of after the frame.
+ */
+static unsigned gcapxdet_events_written(void)
+{
+	const uint32_t base = (uint32_t)up_bdshot_rx_buffer(0);
+	const uint32_t dst = HPM_XDMA->CHCTRL[0].DSTADDR;
+
+	if (dst < base) {
+		return 0u;
+	}
+
+	const unsigned n = (unsigned)((dst - base) / 8u);
+
+	return (n > 32u) ? 32u : n;
+}
+
+struct gcapxdet_hit {
+	unsigned frame;
+	unsigned written_final;
+	bool duplicate;
+	uint32_t pwm_cnt;
+	uint32_t pwm_cmpval;
+	uint32_t pwm_shadow20;
+	uint32_t pwm_reload_w;
+	uint32_t hdma_chen;
+	uint32_t gptmr_cnt;
+	uint32_t gptmr_prd;
+	uint32_t gptmr_dty;
+	uint32_t gptmr_stat;
+	uint32_t xdma_dstaddr;
+	uint32_t xdma_chen;
+};
+
+/* One monitored frame.  Returns -1 on init failure, 1 when the live count
+ * reached 17 events (hit filled), 0 for a normal frame.  *duration_bits_x10 is
+ * always the measured frame duration in tenths of a bit period, which is the
+ * TX/RX discriminator: a spurious pair does not lengthen the frame, a real
+ * extra pulse would.
+ */
+static int gcapxdet_frame(unsigned rate_kbit, uint32_t throttle,
+			  gcapxdet_hit *hit, uint32_t *duration_bits_x10)
+{
+	up_bdshot_rx_deinit();
+	up_dshot_deinit();
+
+	if (up_dshot_init(0x1, rate_kbit * 1000u, false) != OK) {
+		return -1;
+	}
+
+	if (up_bdshot_rx_init(0x1) != OK) {
+		return -1;
+	}
+
+	up_dshot_arm(true);
+	up_bdshot_rx_arm();
+	usleep(200);
+	dshot_motor_data_set(0, throttle, false);
+	up_bdshot_rx_flush();
+	usleep(100);
+	up_dshot_trigger();
+
+	const uint32_t core_hz = clock_get_frequency(clock_cpu0);
+	const uint32_t bit_hz = rate_kbit * 1000u;
+
+	if (core_hz == 0u || bit_hz == 0u) {
+		up_bdshot_rx_stop();
+		up_dshot_idle();
+		return -1;
+	}
+
+	const uint32_t cycles_per_bit = core_hz / bit_hz;
+	const uint32_t t0 = gcapxdet_cycles();
+	unsigned last = 0u;
+	uint32_t last_change = t0;
+	bool detected = false;
+	unsigned guard = 0u;
+
+	for (;;) {
+		const unsigned w = gcapxdet_events_written();
+		const uint32_t now = gcapxdet_cycles();
+
+		if (w != last) {
+			last = w;
+			last_change = now;
+		}
+
+		if (w >= 17u) {
+			detected = true;
+			break;
+		}
+
+		/* A normal frame ends its pulse train at 16 events. */
+		if (w == 16u && (now - last_change) > (2u * cycles_per_bit)) {
+			break;
+		}
+
+		if ((now - t0) > (40u * cycles_per_bit) || ++guard > 20000000u) {
+			break;
+		}
+	}
+
+	/* Let an anomalous frame settle so the end time reflects the last event. */
+	uint32_t settle = gcapxdet_cycles();
+	unsigned written = gcapxdet_events_written();
+	last_change = settle;
+
+	for (;;) {
+		const unsigned w = gcapxdet_events_written();
+		const uint32_t now = gcapxdet_cycles();
+
+		if (w != written) {
+			written = w;
+			last_change = now;
+		}
+
+		if ((now - last_change) > (3u * cycles_per_bit)) {
+			break;
+		}
+
+		if ((now - settle) > (12u * cycles_per_bit)) {
+			break;
+		}
+	}
+
+	const uint32_t t_end = last_change;
+	*duration_bits_x10 = (uint32_t)(((uint64_t)(t_end - t0) * 10u * bit_hz) / core_hz);
+
+	up_bdshot_rx_stop();
+
+	if (!detected) {
+		up_dshot_idle();
+		return 0;
+	}
+
+	const uint32_t *buf = up_bdshot_rx_buffer(0);
+
+	hit->written_final = written;
+	hit->duplicate = false;
+
+	if (written >= 2u) {
+		const unsigned a = 2u * (written - 1u);
+		const unsigned b = 2u * (written - 2u);
+		hit->duplicate = (buf[a] == buf[b]) && (buf[a + 1u] == buf[b + 1u]);
+	}
+
+	hit->pwm_cnt = PWM_BASE->CNT_VAL[0];
+	hit->pwm_cmpval = PWM_BASE->CMP_VAL_WORK[0];
+	hit->pwm_shadow20 = PWM_BASE->SHADOW_VAL[PWMV2_SHADOW_INDEX(20)];
+	hit->pwm_reload_w = PWM_BASE->CNT_RELOAD_WORK[0];
+	hit->hdma_chen = HPM_HDMA->CHEN;
+	hit->gptmr_cnt = HPM_GPTMR0->CHANNEL[3].CNT;
+	hit->gptmr_prd = HPM_GPTMR0->CHANNEL[3].CAPPRD;
+	hit->gptmr_dty = HPM_GPTMR0->CHANNEL[3].CAPDTY;
+	hit->gptmr_stat = gptmr_get_status(HPM_GPTMR0);
+	hit->xdma_dstaddr = HPM_XDMA->CHCTRL[0].DSTADDR;
+	hit->xdma_chen = HPM_XDMA->CHEN;
+
+	up_dshot_idle();
+
+	return 1;
+}
+
+static int gcapxdet_run(unsigned rate_kbit, unsigned throttle_percent, unsigned count, unsigned warmup_kbit)
+{
+	if (rate_kbit < 20u || rate_kbit > 1200u || count == 0u) {
+		PX4_ERR("usage: pwmv2test gcapxdet <rate_kbit> <throttle_pct> <count> [warmup_kbit]");
+		return 1;
+	}
+
+	uint32_t throttle = 48u + throttle_percent * 2000u / 100u;
+
+	if (throttle > 2047u) {
+		throttle = 2047u;
+	}
+
+	const uint16_t packet = (uint16_t)((throttle << 1) & 0xFFFFu);
+	const uint16_t crc = (packet ^ (packet >> 4) ^ (packet >> 8)) & 0x0F;
+	const uint16_t sent = (uint16_t)((packet << 4) | crc);
+
+	unsigned matches = 0u;
+	unsigned failures = 0u;
+	unsigned normal = 0u;
+	unsigned ran = 0u;
+	uint32_t dur_sum = 0u;
+	uint32_t dur_min = 0xFFFFFFFFu;
+	uint32_t dur_max = 0u;
+	uint32_t det_dur = 0u;
+	gcapxdet_hit hit = {};
+
+	for (unsigned i = 0; i < count; i++) {
+		uint32_t dur = 0u;
+
+		if (warmup_kbit != 0u) {
+			gcapxdet_hit warm_hit = {};
+			uint32_t warm_dur = 0u;
+			(void)gcapxdet_frame(warmup_kbit, throttle, &warm_hit, &warm_dur);
+		}
+
+		const int rc = gcapxdet_frame(rate_kbit, throttle, &hit, &dur);
+		ran = i + 1u;
+
+		if (rc < 0) {
+			return 1;
+		}
+
+		if (rc > 0) {
+			hit.frame = i;
+			det_dur = dur;
+			up_bdshot_rx_stop();
+			PX4_INFO("gcapxdet: DETECTED frame %u rate %u thr %u written_final %u",
+				 i, rate_kbit, (unsigned)throttle, hit.written_final);
+			break;
+		}
+
+		uint16_t frame = 0;
+		unsigned pairs = 0;
+		const int frc = up_bdshot_rx_frame(0, &frame, &pairs);
+
+		if (frc == OK && frame == sent) {
+			matches++;
+
+		} else {
+			failures++;
+		}
+
+		normal++;
+		dur_sum += dur;
+
+		if (dur < dur_min) {
+			dur_min = dur;
+		}
+
+		if (dur > dur_max) {
+			dur_max = dur;
+		}
+	}
+
+	const bool detected = (hit.written_final != 0u);
+
+	if (!detected) {
+		PX4_INFO("gcapxdet: %u frames, %u matches, %u failures, detected=0", ran, matches, failures);
+		PX4_INFO("gcapxdet: reference frame duration %u..%u (x0.1 bit), mean %u",
+			 (unsigned)dur_min, (unsigned)dur_max,
+			 (unsigned)(normal ? (dur_sum / normal) : 0u));
+		return (failures == 0u) ? 0 : 1;
+	}
+
+	const uint32_t *buf = up_bdshot_rx_buffer(0);
+
+	for (unsigned k = 0; k < hit.written_final && k < 20u; k++) {
+		PX4_INFO("gcapxdet: pair %2u prd %6u dty %6u", k,
+			 (unsigned)buf[2u * k], (unsigned)buf[2u * k + 1u]);
+	}
+
+	PX4_INFO("gcapxdet: PWM cnt %u cmpval %08x shadow20 %08x reload_w %08x hdma_chen %08x",
+		 (unsigned)hit.pwm_cnt, (unsigned)hit.pwm_cmpval, (unsigned)hit.pwm_shadow20,
+		 (unsigned)hit.pwm_reload_w, (unsigned)hit.hdma_chen);
+	PX4_INFO("gcapxdet: GPTMR cnt %08x prd %08x dty %08x stat %08x",
+		 (unsigned)hit.gptmr_cnt, (unsigned)hit.gptmr_prd, (unsigned)hit.gptmr_dty,
+		 (unsigned)hit.gptmr_stat);
+	PX4_INFO("gcapxdet: XDMA dstaddr %08x chen %08x dup_last %u",
+		 (unsigned)hit.xdma_dstaddr, (unsigned)hit.xdma_chen, hit.duplicate ? 1u : 0u);
+
+	const uint32_t ref = normal ? (dur_sum / normal) : 0u;
+	const int32_t delta = (int32_t)det_dur - (int32_t)ref;
+	const char *verdict = "unknown";
+
+	if (normal && delta >= 5) {
+		verdict = "TX";
+
+	} else if (normal && delta >= -3 && delta <= 3) {
+		verdict = "RX";
+	}
+
+	PX4_INFO("gcapxdet: TIMING duration %u (x0.1 bit) reference %u delta %d verdict %s",
+		 (unsigned)det_dur, (unsigned)ref, (int)delta, verdict);
+	PX4_INFO("gcapxdet: %u frames, %u matches, %u failures, detected=1", ran, matches, failures);
+
+	return 0;
+}
 extern "C" int pwmv2test_main(int argc, char *argv[])
 {
 	uint32_t frequency = 1000;
@@ -1263,6 +1557,15 @@ extern "C" int pwmv2test_main(int argc, char *argv[])
 	unsigned dshot_rate = 600;
 	unsigned dshot_throttle = 0;
 	unsigned dshot_frames = 3000;   /* duration, ms */
+
+	if (argc > 1 && strcmp(argv[1], "gcapxdet") == 0) {
+		const unsigned det_rate = (argc > 2) ? strtoul(argv[2], nullptr, 0) : 600u;
+		const unsigned det_thr = (argc > 3) ? strtoul(argv[3], nullptr, 0) : 50u;
+		const unsigned det_count = (argc > 4) ? strtoul(argv[4], nullptr, 0) : 500u;
+		const unsigned det_warm = (argc > 5) ? strtoul(argv[5], nullptr, 0) : 0u;
+
+		return gcapxdet_run(det_rate, det_thr, det_count, det_warm);
+	}
 
 	if (argc > 1 && strcmp(argv[1], "gcapxloop") == 0) {
 		const unsigned rate = (argc > 2) ? strtoul(argv[2], nullptr, 0) : 150u;
