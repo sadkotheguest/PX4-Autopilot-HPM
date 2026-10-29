@@ -60,6 +60,7 @@
 #include <nuttx/mmcsd.h>
 #include <nuttx/analog/adc.h>
 #include <nuttx/mm/gran.h>
+#include <nuttx/mm/mm.h>
 #include <chip.h>
 
 #include <arch/board/board.h>
@@ -76,6 +77,8 @@
 #include <px4_platform/board_dma_alloc.h>
 
 #include "hpm_common.h"
+#include "hpm_sdram.h"
+#include <nuttx/cache.h>
 #ifdef CONFIG_HPM_USBDEV
 #  include "hpm_usbdev.h"
 #endif
@@ -248,9 +251,65 @@ hpm_boardinitialize(void)
  * SPI is not ported to HPM6E00 yet - see bringup_stubs.cpp.
  */
 
+/* External SDRAM: the FEMC is programmed from __hpm_start() (see
+ * hpm_sdram_preinit()), before anything can touch the window.  Here the memory
+ * is verified and handed to the heap.
+ */
+
+static int board_sdram_selftest(uintptr_t base, size_t size)
+{
+	/* Write the pattern, push it out of the cache and drop it, so the read
+	 * below has to come from the SDRAM itself.  Turning the data cache off
+	 * for the duration is not an option: up_disable_dcache() only gates the
+	 * cache, it does not flush, so the RTOS state (IRQ table included) would
+	 * be read stale while the test runs.
+	 */
+
+	volatile uint32_t *mem = (volatile uint32_t *)base;
+	const uint32_t count = size / 4u;
+	int ret = OK;
+
+	for (uint32_t i = 0; i < count; i++) {
+		mem[i] = (i << 24) | ((i + 1) << 16) | ((i + 2) << 8) | (i + 3);
+	}
+
+	up_clean_dcache(base, base + size);
+	up_invalidate_dcache(base, base + size);
+
+	for (uint32_t i = 0; i < count; i++) {
+		const uint32_t expect = (i << 24) | ((i + 1) << 16) | ((i + 2) << 8) | (i + 3);
+
+		if (mem[i] != expect) {
+			ret = -EIO;
+			break;
+		}
+	}
+
+	return ret;
+}
+
  __EXPORT int board_app_initialize(uintptr_t arg)
 {
 	printf("\n\nHPMicro PX4\n");
+
+	/* External SDRAM: the FEMC was programmed from __hpm_start() before the
+	 * RTOS came up, so the window is live now.  Verify it and hand it to the
+	 * heap.  The self test covers the first megabyte only - a full 32 MB pass
+	 * would add seconds to every boot, and a part that fails early fails
+	 * everywhere.
+	 */
+
+	if (hpm_sdram_size() < 0) {
+		syslog(LOG_ERR, "[boot] SDRAM init failed\n");
+
+	} else if (board_sdram_selftest(HPM_SDRAM_BASE, 1024 * 1024) < 0) {
+		syslog(LOG_ERR, "[boot] SDRAM self test failed (expansion board not fitted?)\n");
+
+	} else {
+		syslog(LOG_INFO, "[boot] SDRAM: %u MB at 0x%08x added to the heap\n",
+		       (unsigned)(HPM_SDRAM_SIZE >> 20), (unsigned)HPM_SDRAM_BASE);
+		umm_addregion((void *)HPM_SDRAM_BASE, HPM_SDRAM_SIZE);
+	}
 
 	px4_arch_configgpio(GPIO_LED_SAFETY);
 	px4_arch_configgpio(GPIO_BTN_SAFETY);
