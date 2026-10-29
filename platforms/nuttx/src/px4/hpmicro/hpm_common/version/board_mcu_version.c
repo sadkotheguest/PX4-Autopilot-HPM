@@ -79,7 +79,7 @@ int board_mcu_version(char *rev, const char **revstr, const char **errata)
 	 * mapping can be extended without guessing.
 	 */
 
-	PX4_INFO("HPM OTP chip id 0x%08x is not known", chip_id);
+	PX4_INFO("HPM OTP chip id 0x%08lx is not known", (unsigned long)chip_id);
 
 	return -1;
 }

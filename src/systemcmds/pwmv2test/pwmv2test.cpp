@@ -73,7 +73,13 @@
 #include "hpm_dmamux_drv.h"
 #include "hpm_trgm_drv.h"
 #include "hpm_trgmmux_src.h"
+/* The SDK header declares struct gptmr_channel_monitor_config and a function of
+ * the same name, which C++ reports as a hiding constructor under -Wshadow.
+ * It is a C header and the diagnostic is not actionable here. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wshadow"
 #include "hpm_gptmr_drv.h"
+#pragma GCC diagnostic pop
 
 static PWMV2_Type *const PWM_BASE = HPM_PWM1;
 
