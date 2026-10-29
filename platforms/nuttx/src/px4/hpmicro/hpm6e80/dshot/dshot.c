@@ -315,10 +315,13 @@ static int dshot_dma_init(void)
 	dma_conf.src_addr = (uint32_t)frame_buf;
 	dma_conf.dst_addr = (uint32_t)&pwm->SHADOW_VAL[DSHOT_BIT_SLOT0];
 	dma_conf.size_in_byte = num_channels * sizeof(uint32_t);
-	/* CHCTRL itself performs the first transfer (word 0), so the chain must
-	 * continue with descriptor 1 - otherwise word 0 is sent twice.
+	/* In the free-running counter scheme the whole frame is fed by the chain: the
+	 * channel-control transfer that used to supply word 0 is not performed when
+	 * the channel is enabled mid-period, so descriptor 0 (word 0 = bit15) has to
+	 * be the first node.  Starting at descriptor 1 dropped bit15 - the frame went
+	 * out as word1..word16, i.e. 15 pulses and the idle word.
 	 */
-	dma_conf.linked_ptr = (uint32_t)&dshot_desc[1];
+	dma_conf.linked_ptr = (uint32_t)&dshot_desc[0];
 	dma_conf.en_infiniteloop = false;
 	dma_conf.handshake_opt = DMA_HANDSHAKE_OPT_ONE_BURST;
 	dma_conf.interrupt_mask = DMA_INTERRUPT_MASK_ALL & ~DMA_INTERRUPT_MASK_TERMINAL_COUNT;
@@ -391,6 +394,16 @@ int up_dshot_init(uint32_t channel_mask_in, unsigned dshot_pwm_freq, bool enable
 		return ret;
 	}
 
+	/* The PWM counter runs from configuration time: the duty shadow holds an
+	 * out-of-range value (no pulse, line low), and a frame is started later by
+	 * letting the DMA feed the shadow from a defined point of the free-running
+	 * period.  Starting the counter per frame instead made the first bit depend
+	 * on a race against the first reload.
+	 */
+	pwmv2_reset_counter(pwm, counter);
+	pwmv2_enable_counter(pwm, counter);
+	pwmv2_start_pwm_output(pwm, counter);
+
 	initialized = true;
 	armed = false;
 
@@ -410,12 +423,12 @@ void dshot_motor_data_set(unsigned channel, uint16_t throttle, bool telemetry)
 
 	dshot_build_channel(channel);
 
-	/* Preload bit 15 straight into the shadow here, long before the DMA chain is
-	 * armed, so the first chain write cannot overwrite it before the first pulse
-	 * of the frame is generated.
+	/* Keep the duty shadow out of range while the frame is being prepared: the
+	 * counter runs freely, and this value never matches, so the line stays low.
+	 * The frame itself is fed by the DMA (word 0 = bit15 is the first transfer).
 	 */
 	pwmv2_shadow_register_unlock(pwm);
-	pwmv2_set_shadow_val(pwm, dshot_shadow(channel), reload, 0, false);
+	pwmv2_set_shadow_val(pwm, dshot_shadow(channel), reload + (reload / 2u), 0, false);
 	pwmv2_shadow_register_lock(pwm);
 }
 
@@ -445,11 +458,6 @@ void up_dshot_trigger(void)
 		return;
 	}
 
-	/* bit15 was preloaded when the frame was set; here only the lock event and
-	 * the DMA chain are (re)armed.
-	 */
-	pwmv2_shadow_register_lock(pwm);
-
 	/* Re-arm the descriptor chain from its first node. */
 	dma_clear_transfer_status(dma_res.base, dma_res.channel);
 
@@ -457,13 +465,28 @@ void up_dshot_trigger(void)
 		return;
 	}
 
+	/* The counter runs freely, so the frame has to start at a defined phase of the
+	 * period: the duty shadow written by the DMA is latched into the comparator at
+	 * the next reload, and the compare request that feeds the following word must
+	 * not fire before that.  Prime the frame just past the compare request point,
+	 * with a margin so the request line has definitely dropped before the channel
+	 * is enabled; the first period then stays idle and the frame starts on the
+	 * next one.  (Priming right after the reload instead was measured to produce
+	 * an extra edge on ~50 % of the frames - see BDSHOT_PLAN.md.)
+	 */
+	const uint32_t request_point = reload / 2u;
+	const uint32_t margin = (reload / 32u) + 1u;
+	const uint32_t limit = (request_point > margin) ? (request_point - margin) : 0u;
+
+	for (unsigned i = 0; i < 1000000u; i++) {
+		if (pwm->CNT_VAL[counter] < limit) {
+			break;
+		}
+	}
+
 	if (dma_mgr_enable_channel(&dma_res) != status_success) {
 		return;
 	}
-
-	pwmv2_reset_counter(pwm, counter);
-	pwmv2_enable_counter(pwm, counter);
-	pwmv2_start_pwm_output(pwm, counter);
 }
 
 void up_dshot_idle(void)
