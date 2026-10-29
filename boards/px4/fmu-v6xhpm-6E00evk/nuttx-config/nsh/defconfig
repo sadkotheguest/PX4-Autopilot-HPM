@@ -240,9 +240,13 @@ CONFIG_NET_UDP_CHECKSUMS=y
 CONFIG_NET_TCP=y
 CONFIG_NET_ETH_PKTSIZE=1518
 CONFIG_NETDEV_PHY_IOCTL=y
-CONFIG_NETINIT_IPADDR=0xA9FE0101
-CONFIG_NETINIT_DRIPADDR=0xA9FE0001
-CONFIG_NETINIT_NETMASK=0xFFFF0000
+# The address above is the default for a board on a normal LAN.  For a board
+# cabled directly to a development host that only has an APIPA address, use
+# 169.254.1.1/16 with gateway 169.254.0.1 instead (both ends then share the
+# link-local subnet without touching the host configuration).
+CONFIG_NETINIT_IPADDR=0xC0A80114
+CONFIG_NETINIT_DRIPADDR=0xC0A80101
+CONFIG_NETINIT_NETMASK=0xFFFFFF00
 CONFIG_NETINIT_THREAD=y
 CONFIG_NETINIT_THREAD_PRIORITY=49
 CONFIG_HPM_ENET=y
