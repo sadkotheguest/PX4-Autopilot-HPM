@@ -256,6 +256,9 @@ hpm_boardinitialize(void)
  * is verified and handed to the heap.
  */
 
+/* Start of the non-cacheable DMA window inside the external SDRAM (linker script). */
+extern char __sdram_nc_start__[];
+
 static int board_sdram_selftest(uintptr_t base, size_t size)
 {
 	/* Write the pattern, push it out of the cache and drop it, so the read
@@ -306,9 +309,18 @@ static int board_sdram_selftest(uintptr_t base, size_t size)
 		syslog(LOG_ERR, "[boot] SDRAM self test failed (expansion board not fitted?)\n");
 
 	} else {
+		/* The tail of the SDRAM is the non-cacheable DMA window (region
+		 * SDRAM_NC in the linker script), so only the part in front of it
+		 * becomes heap.
+		 */
+
+		const uintptr_t nc_start = (uintptr_t)__sdram_nc_start__;
+		const size_t heap_size = (nc_start > HPM_SDRAM_BASE) ?
+					 (nc_start - HPM_SDRAM_BASE) : HPM_SDRAM_SIZE;
+
 		syslog(LOG_INFO, "[boot] SDRAM: %u MB at 0x%08x added to the heap\n",
-		       (unsigned)(HPM_SDRAM_SIZE >> 20), (unsigned)HPM_SDRAM_BASE);
-		umm_addregion((void *)HPM_SDRAM_BASE, HPM_SDRAM_SIZE);
+		       (unsigned)(heap_size >> 20), (unsigned)HPM_SDRAM_BASE);
+		umm_addregion((void *)HPM_SDRAM_BASE, heap_size);
 	}
 
 	px4_arch_configgpio(GPIO_LED_SAFETY);
