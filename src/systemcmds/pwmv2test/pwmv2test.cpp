@@ -1033,9 +1033,13 @@ static void gcapxev_read_pwm_regs(gcapxev_pwm_regs *regs)
 
 static void gcapxev_print_pwm_regs(const char *when, unsigned idx, const gcapxev_pwm_regs *regs)
 {
-	PX4_INFO("gcapxev: regs %s f%u WORK1 0x%08x RELOAD_W 0x%08x CMPVAL_W 0x%08x CNT_W 0x%08x SHADOW20 0x%08x CMP0CFG 0x%08x",
-		 when, idx, (unsigned)regs->work1, (unsigned)regs->reload_w, (unsigned)regs->cmpval_w,
-		 (unsigned)regs->cnt_w, (unsigned)regs->shadow20, (unsigned)regs->cmp0cfg);
+	/* Two short lines on purpose: the console log truncates long lines, so the
+	 * single line used to cut SHADOW20/CMP0CFG off exactly where they matter.
+	 */
+	PX4_INFO("gcapxev: regs %s f%u WORK1 %08x RELOAD_W %08x CMPVAL_W %08x",
+		 when, idx, (unsigned)regs->work1, (unsigned)regs->reload_w, (unsigned)regs->cmpval_w);
+	PX4_INFO("gcapxev: regs %s f%u CNT_W %08x SHADOW20 %08x CMP0CFG %08x",
+		 when, idx, (unsigned)regs->cnt_w, (unsigned)regs->shadow20, (unsigned)regs->cmp0cfg);
 }
 
 /* One full receive frame in the gcapx_run() sequence.  Snapshots the PWM
