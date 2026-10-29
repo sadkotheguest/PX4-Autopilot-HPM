@@ -1,0 +1,24 @@
+#!/bin/sh
+#
+# HPM6E80 board storage fallback.
+#
+# The SoC has no SD card controller.  The board code registers an 8 MB RAM disk
+# as /dev/ram0, which is formatted and mounted where PX4 expects the SD card so
+# that dataman and the logger have a writable volume.  Contents are lost on
+# reset by design - download the logs over MAVLink FTP before rebooting.
+#
+if [ -b /dev/ram0 ]
+then
+	if mkfatfs /dev/ram0
+	then
+		if mount -t vfat /dev/ram0 /fs/microsd
+		then
+			set STORAGE_AVAILABLE yes
+			echo "INFO [init] RAM disk mounted at /fs/microsd (volatile)"
+		else
+			echo "ERROR [init] RAM disk mount failed"
+		fi
+	else
+		echo "ERROR [init] RAM disk format failed"
+	fi
+fi

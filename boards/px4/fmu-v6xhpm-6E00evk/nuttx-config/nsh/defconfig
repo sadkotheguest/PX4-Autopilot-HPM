@@ -256,3 +256,8 @@ CONFIG_HPM_ENET_LOG_ERROR=y
 # (IPv6 multicast from the host).  syslog from that context deadlocks the PX4
 # console, so it stays off.
 # CONFIG_HPM_ENET_LOG_WARN is not set
+
+# Storage: no SD card controller on the HPM6E80, so the board registers an 8 MB
+# RAM disk (mkrd) that rc.board_storage formats with FAT and mounts at
+# /fs/microsd for dataman and the logger.
+CONFIG_DRVR_MKRD=y

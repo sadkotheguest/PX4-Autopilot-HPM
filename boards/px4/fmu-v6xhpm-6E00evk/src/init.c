@@ -79,6 +79,9 @@
 #include "hpm_common.h"
 #include "hpm_sdram.h"
 #include <nuttx/cache.h>
+#ifdef CONFIG_DRVR_MKRD
+#  include <nuttx/drivers/ramdisk.h>
+#endif
 #ifdef CONFIG_HPM_USBDEV
 #  include "hpm_usbdev.h"
 #endif
@@ -322,6 +325,22 @@ static int board_sdram_selftest(uintptr_t base, size_t size)
 		       (unsigned)(heap_size >> 20), (unsigned)HPM_SDRAM_BASE);
 		umm_addregion((void *)HPM_SDRAM_BASE, heap_size);
 	}
+
+#ifdef CONFIG_DRVR_MKRD
+	/* There is no SD card controller on this SoC, so PX4 would have nowhere to
+	 * put dataman and the logs.  Register an 8 MB RAM disk here; the board's
+	 * rc.board_storage script formats and mounts it at /fs/microsd.  The heap
+	 * it comes from is the external SDRAM, and the contents are volatile.
+	 */
+
+	{
+		int ret = mkrd(0, 8 * 1024 * 1024 / 512, 512, RDFLAG_WRENABLED | RDFLAG_FUNLINK);
+
+		if (ret != OK) {
+			syslog(LOG_ERR, "[boot] RAM disk registration failed: %d\n", ret);
+		}
+	}
+#endif
 
 	px4_arch_configgpio(GPIO_LED_SAFETY);
 	px4_arch_configgpio(GPIO_BTN_SAFETY);

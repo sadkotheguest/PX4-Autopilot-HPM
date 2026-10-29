@@ -25,3 +25,8 @@
 # fi
 
 safety_button start
+
+# No SD card controller on this SoC and the storage is a small volatile RAM
+# disk, so the logger would refuse to start (it wants 50 MiB free).  Stream
+# the logs to the ground station over MAVLink (Ethernet) instead.
+set LOGGER_ARGS "-m mavlink"

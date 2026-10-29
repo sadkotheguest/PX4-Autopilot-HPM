@@ -94,6 +94,19 @@ else
 	fi
 fi
 
+
+#
+# Optional board storage fallback: used by boards that have no SD card
+# controller (for example the HPM6E80).  The script is expected to mount
+# its storage and set STORAGE_AVAILABLE yes.
+#
+set BOARD_RC_STORAGE ${R}etc/init.d/rc.board_storage
+if [ -f $BOARD_RC_STORAGE ]
+then
+	. $BOARD_RC_STORAGE
+fi
+unset BOARD_RC_STORAGE
+
 if [ $STORAGE_AVAILABLE = yes ]
 then
 	if hardfault_log check
