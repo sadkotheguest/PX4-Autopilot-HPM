@@ -261,3 +261,8 @@ CONFIG_HPM_ENET_LOG_ERROR=y
 # RAM disk (mkrd) that rc.board_storage formats with FAT and mounts at
 # /fs/microsd for dataman and the logger.
 CONFIG_DRVR_MKRD=y
+# Soft links in the pseudo file system: /fs/microsd is an alias for the real
+# RAM-disk volume at /fs/ramfs (PX4 hardcodes the former as its storage path).
+CONFIG_PSEUDOFS_SOFTLINKS=y
+# The 'ln' builtin is needed to create the /fs/microsd alias at boot.
+# CONFIG_NSH_DISABLE_LN is not set
