@@ -131,6 +131,8 @@ void up_dshot_set_buffer_region(int region)
 	frame_buf = region ? frame_buf_nc : frame_buf_ahb;
 }
 
+void up_dshot_deinit(void);   /* used by up_dshot_init() to apply a new config */
+
 static uint8_t dshot_shadow(unsigned channel)
 {
 	return DSHOT_BIT_SLOT0 + channel;
@@ -375,8 +377,17 @@ int up_dshot_init(uint32_t channel_mask_in, unsigned dshot_pwm_freq, bool enable
 		return -EINVAL;
 	}
 
+	/* Re-initialise when the requested configuration differs from the live one:
+	 * silently keeping the old mask or bit rate made a second up_dshot_init() a
+	 * no-op (the harness ended up transmitting on one channel after asking for
+	 * four, and a rate change would have been ignored as well).
+	 */
 	if (initialized) {
-		return OK;
+		if ((channel_mask == (uint8_t)(channel_mask_in & 0xF)) && (dshot_bit_hz == dshot_pwm_freq)) {
+			return OK;
+		}
+
+		up_dshot_deinit();
 	}
 
 	channel_mask = (uint8_t)(channel_mask_in & 0xF);

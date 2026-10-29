@@ -888,3 +888,24 @@ independent transmitter window.
 
 `gcapxev` stays in `pwmv2test` because it reproduces the older variants of this
 on demand; `gcapxdet` is the stress test for this class of timing races.
+
+### API note: `up_dshot_init()` reconfigures on a mask or rate change
+
+`up_dshot_init()` used to return OK without doing anything when the library was
+already initialised, regardless of the requested channel mask or bit rate.  A
+second call with a different configuration was therefore a silent no-op: the
+harness asked for four channels and kept transmitting on one (visible as "1 ch"
+in the `dshot` command output), and a rate change would have been ignored as
+well.  It now compares the request with the live mask/bit rate and, when they
+differ, releases the channel and re-initialises.
+
+Verified without the loopback jumper (transmitter only, frame completion time
+from the DMA terminal count): `pwmv2test dshot` at 600, 150, 300 and 600 kbit/s
+in one session reports 4 channels every time and completes each frame in the
+expected 17 bit periods - minimum trigger-to-done 31 / 116 / 60 / 31 us for
+1.67 / 6.67 / 3.33 / 1.67 us bit periods, with 500/200/300/500 frames complete.
+(The min value is the useful one; the average and maximum are dominated by
+interrupt latency of the terminal-count callback, not by the transfer.)
+
+The receive regression for this change (sweep, loop, `gcapxdet`) still has to be
+re-run once the PE08 -> PE09 loopback jumper is back in place.
