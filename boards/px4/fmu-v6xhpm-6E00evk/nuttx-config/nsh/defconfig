@@ -213,3 +213,35 @@ CONFIG_HPM_PWM1=y
 
 # DMA (HDMA): needed by the PWMv2 DShot bring-up (PWM DMA request via TRGM)
 CONFIG_HPM_DMA=y
+
+# Ethernet: ENET0 (RGMII) with the on-board PHY.  Bring-up uses a static
+# address on the bench (192.168.1.20/24, gateway 192.168.1.1) so the link can be
+# verified with ping before PX4/mavlink is put on top of it.
+CONFIG_NET=y
+CONFIG_NET_ARP_IPIN=y
+CONFIG_NET_ARP_SEND=y
+CONFIG_NET_BROADCAST=y
+CONFIG_NET_SOCKOPTS=y
+CONFIG_NET_ICMP=y
+CONFIG_NET_ICMP_SOCKET=y
+CONFIG_NET_UDP=y
+CONFIG_NET_UDP_CHECKSUMS=y
+CONFIG_NET_TCP=y
+CONFIG_NET_ETH_PKTSIZE=1518
+CONFIG_NETDEV_PHY_IOCTL=y
+CONFIG_NETINIT_IPADDR=0xC0A80114
+CONFIG_NETINIT_DRIPADDR=0xC0A80101
+CONFIG_NETINIT_NETMASK=0xFFFFFF00
+CONFIG_NETINIT_THREAD=y
+CONFIG_NETINIT_THREAD_PRIORITY=49
+CONFIG_HPM_ENET=y
+CONFIG_HPM_ENET0=y
+CONFIG_HPM_ENET_RGMII=y
+CONFIG_HPM_ENET_LINK_MONITOR=y
+CONFIG_HPM_ENET_LINK_MON_INTERVAL_MS=1000
+CONFIG_HPM_ENET_LOG_LINK=y
+CONFIG_HPM_ENET_LOG_ERROR=y
+# The WARN level logs "dropped frame, unknown ethertype" from the receive path
+# (IPv6 multicast from the host).  syslog from that context deadlocks the PX4
+# console, so it stays off.
+# CONFIG_HPM_ENET_LOG_WARN is not set
