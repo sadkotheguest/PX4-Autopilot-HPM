@@ -103,6 +103,10 @@ static inline constexpr uint32_t timerBaseRegister(Timer::Timer timer)
 	case Timer::PWM0: return HPM_PWM0_BASE;
 
 	case Timer::PWM1: return HPM_PWM1_BASE;
+
+	case Timer::PWM2: return HPM_PWM2_BASE;
+
+	case Timer::PWM3: return HPM_PWM3_BASE;
 	}
 
 	return 0;
