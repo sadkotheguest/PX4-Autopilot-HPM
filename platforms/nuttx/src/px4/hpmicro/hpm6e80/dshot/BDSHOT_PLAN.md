@@ -491,8 +491,30 @@ channel per motor (implementation in `dshot.c`, prototypes in
   - `pwmv2test gcapxtimeout` -> wait returns `-ETIMEDOUT` (-116) with no frame
     on the wire (617 us wall time for a 500 us timeout), then a normal frame
     still decodes (`sent 0x830b recv 0x830b`, 66 us).
-- Known residual: the very first frame after a cold boot can be one capture
-  event short.  Every later frame passes, including after re-initialisation.
+- Cleanup build (dead receive experiments removed, see "Dead-code inventory").
+  The deletion itself is behaviour neutral, but it exposed two real bugs in the
+  production receive path, both fixed in the same commit:
+  - `bd_rx_dma_reset()` wrote `CTRL = 0` before clearing the DMA status.  That
+    write also clears the per-channel interrupt mask bits, i.e. it enables
+    every source, and a pending terminal count then raises the XDMA interrupt.
+    The channel is not registered with `dma_mgr`, so `dma_mgr_isr_handler()`
+    cannot acknowledge it and the CPU stays in the ISR forever (console dead,
+    board needs a reset).  Diagnosed by halting the stuck board: PLIC pending
+    bit 140 (`IRQn_XDMA`) set, `mcause` 0x8000_000b, PC inside
+    `dma_mgr_isr_handler()`.  Fixed by clearing the status first, by masking
+    all channel interrupts (the capture window is polled, so the RX channel
+    must not interrupt at all) and by clearing the status in
+    `up_bdshot_rx_stop()` as well.
+  - Result after the fix: three `gcapxsweep` runs back to back (105/105,
+    104/105, 62/63) with no hang, `gcapxloop 600 50 300` -> 300/300,
+    `gcapxtimeout` both cases OK.
+- Known residual, still open: at 150 kbit/s a frame occasionally loses one
+  capture event (the dump shows `prd 417` / `prd 917` pairs around a 666-tick
+  bit, i.e. one measurement taken at the wrong edge), which fails the
+  15-bit + CRC path about one frame in a hundred at that rate (the 104/105 and
+  62/63 above).  300 and 600 kbit/s were clean in every run.  This is the same
+  signature as the first frame after a cold boot, so it is one measurement
+  quality problem at the slowest rate, not a decoding problem.
 
 Not integrated yet: no io_timer / PWM_OUT glue, `CONFIG_DRIVERS_DSHOT` is off,
 GCR decoding and eRPM are not implemented, and the test decodes our own frame
@@ -648,14 +670,19 @@ This replaced the experimental `up_dshot_rxd_*` block.
 `pwmv2test gcapxtimeout` exercises the interrupted-frame path: no frame on the
 wire must return `-ETIMEDOUT`, and the next frame must still decode.
 
-## Dead-code inventory (delete after the port is verified)
+## Dead-code inventory (removed)
 
-Five receive experiments are still compiled into `dshot.c` (PWMv2 capture,
-`rxg`, `rxi`, `rxp`, `rxf`) plus the GPIO port sampler (`rx`).  No production
-code calls any of them; only the matching `pwmv2test` commands do.  The
-old `up_dshot_rxd_*` block has already been removed - it was replaced by the
-production `up_bdshot_rx_*` implementation (previous section), so it is not
-part of the cleanup.
+Five receive experiments (PWMv2 capture, `rxg`, `rxi`, `rxp`, `rxf`) plus the
+GPIO port sampler (`rx`) used to be compiled into `dshot.c`; no production code
+called them, only the matching `pwmv2test` commands.  They are **gone now**, in
+one contiguous cut: `dshot.c` 2286 -> 993 lines and `pwmv2test.cpp`
+3322 -> 1195 lines (dshot.c: 19 insertions / 1312 deletions, pwmv2test.cpp:
+128 insertions / 2255 deletions; the only non-deletion change in the harness is
+one `#include` moved to the top of the file).
+The old `up_dshot_rxd_*` block had already been replaced by the production
+`up_bdshot_rx_*` implementation (previous section).
+
+The table below stays as the record of what was tried and why it was abandoned.
 
 | block | symbols | what it does | tried / result |
 | --- | --- | --- | --- |
@@ -671,28 +698,16 @@ helpers (`up_dshot_rx_restore_outputs`); the production receiver uses
 `bd_rx_pad_input()` instead.  The matching `pwmv2test` commands can be deleted
 together with each `dshot.c` block.
 
-### Cleanup checklist (next step)
+### Cleanup result
 
-1. Delete the six dead blocks and their helpers/statics from `dshot.c`:
-   PWMv2 capture (`up_dshot_capture_*`, `cap_*`, `dshot_capture_isr`,
-   `dshot_cap_push`), `rxg` (`up_dshot_rxg_*`, `up_dshot_rxcfg`, `rxg_*`,
-   `dshot_rxg_tc_cb`, `dshot_rxg_pad`), GPIO sampler (`up_dshot_rx_*`,
-   `rx_*`, `dshot_rx_tc_cb`, `dshot_rx_pins_input/_output`), `rxi`
-   (`up_dshot_rxi_*`, `rxi_*`, `dshot_rxi_isr`, `dshot_rxi_push`), `rxp`
-   (`up_dshot_rxp_*`, `rxp_*`, `dshot_rxp_tc_cb`) and `rxf`
-   (`up_dshot_rxf_*`, `rxf_*`, `dshot_rxf_tc_cb`, `rxf_channel_reset`).
-   Delete the receive-only `pwmv2test` commands and their statics in the same
-   change (`captest`, `capdiag`, `capscan`, `gcapisr`, `gcap`, `gcapseq`,
-   `gcapm`, `gcapmseq`, `gcapd`, `gcapf`, `gcapfsweep`, `rxscan`, `rxslow`,
-   `gpiotest`, `bdscap`, `trgmcap`, `gptmrcap`, `rxfstate`).  Keep the TX
-   diagnostics and the production-path commands (`dshot`, `dshotbuf`,
-   `dmadiag`, `pwmregs`, `cmpdma`, `pollscan`, `gcapx`, `gcapxsweep`,
-   `gcapxloop`, `gcapxtimeout`).
-2. Rebuild and check for unused-function / unused-variable warnings; the
-   `MAX_CUSTOM_OPT_LEVEL` build treats them as errors, so the compiler is the
-   proof that nothing else references the deleted blocks.
-3. Re-run `gcapxsweep`, `gcapxtimeout` and `pollscan` to show the production
-   path was not touched by the deletion.
+Performed as described in the checklist above.  The build is the proof: after
+the cut `dshot.c` and `pwmv2test.cpp` compile with no unused-function or
+unused-variable warnings (the only remaining warning is the SDK's
+`gptmr_channel_monitor_config` shadow warning from `hpm_gptmr_drv.h`).
+Hardware: three `gcapxsweep` runs back to back, `gcapxloop` 300/300,
+`gcapxtimeout` both cases and an unchanged `pollscan` - see "Current status".
+Commands kept: `dshot`, `dshotbuf`, `dmadiag`, `pwmregs`, `cmpdma`,
+`gpiotest`, `pollscan`, `gcapx`, `gcapxsweep`, `gcapxloop`, `gcapxtimeout`.
 
 ## Open items
 
