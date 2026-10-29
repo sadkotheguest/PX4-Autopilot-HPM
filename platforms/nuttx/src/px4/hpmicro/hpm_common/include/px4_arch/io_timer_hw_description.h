@@ -39,7 +39,16 @@
 #include <px4_platform_common/constexpr_util.h>
 #include <px4_platform_common/px4_config.h>
 #include <px4_platform/io_timer_init.h>
+
+/* HPM6E00 uses the PWMv2 IP with its own driver header; the older chips
+ * (HPM6750/HPM6360) use the legacy PWM driver.
+ */
+#if defined(CONFIG_ARCH_CHIP_HPM6E00_SDK)
+#include "hpm_pwmv2_drv.h"
+#else
 #include "hpm_pwm_drv.h"
+#endif
+
 #include "hpm_clock_drv.h"
 
 static inline constexpr timer_io_channels_t initIOTimerGPIOInOut(Timer::TimerChannel timer, GPIO::GPIOPin pin);

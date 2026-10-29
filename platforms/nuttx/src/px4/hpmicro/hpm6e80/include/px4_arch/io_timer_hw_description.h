@@ -35,6 +35,10 @@
 
 #include "../../../hpm_common/include/px4_arch/io_timer_hw_description.h"
 
+/* HPM6E00: PWMv2, four counters per module and two channels per counter.
+ * All PWM modules share TRGM0 and are clocked through the AHB clock nodes.
+ */
+
 static inline constexpr timer_io_channels_t initIOTimerGPIOInOut(Timer::TimerChannel timer, GPIO::GPIOPin pin)
 {
 	timer_io_channels_t ret{};
@@ -54,15 +58,29 @@ static inline constexpr io_timers_t initIOTimer(Timer::Timer timer)
 	case Timer::PWM0:
 		ret.base = HPM_PWM0_BASE;
 		ret.trgm_base = HPM_TRGM0_BASE;
-		ret.clock_name = (uint32_t)clock_mot0;
+		ret.clock_name = (uint32_t)clock_pwm0;
 		ret.vectorno =  HPM_IRQn_PWM0;
 		break;
 
 	case Timer::PWM1:
 		ret.base = HPM_PWM1_BASE;
-		ret.trgm_base = HPM_TRGM1_BASE;
-		ret.clock_name = (uint32_t)clock_mot1;
+		ret.trgm_base = HPM_TRGM0_BASE;
+		ret.clock_name = (uint32_t)clock_pwm1;
 		ret.vectorno =  HPM_IRQn_PWM1;
+		break;
+
+	case Timer::PWM2:
+		ret.base = HPM_PWM2_BASE;
+		ret.trgm_base = HPM_TRGM0_BASE;
+		ret.clock_name = (uint32_t)clock_pwm2;
+		ret.vectorno =  HPM_IRQn_PWM2;
+		break;
+
+	case Timer::PWM3:
+		ret.base = HPM_PWM3_BASE;
+		ret.trgm_base = HPM_TRGM0_BASE;
+		ret.clock_name = (uint32_t)clock_pwm3;
+		ret.vectorno =  HPM_IRQn_PWM3;
 		break;
 
 	default: break;
@@ -70,4 +88,3 @@ static inline constexpr io_timers_t initIOTimer(Timer::Timer timer)
 
 	return ret;
 }
-

@@ -1,0 +1,34 @@
+#!/bin/sh
+#
+# HPM6E80 board storage fallback.
+#
+# The SoC has no SD card controller.  The board code registers an 8 MB RAM disk
+# as /dev/ram0, which is formatted and mounted as the flight-storage volume.
+# It lives at /fs/ramfs - the honest name - and /fs/microsd is kept as a soft
+# link because the PX4 code and the common start-up scripts use that path.
+#
+# The contents are lost on reset by design; the logger streams to the ground
+# station over MAVLink instead of writing here (it wants 50 MiB free).
+#
+if [ -b /dev/ram0 ]
+then
+	mkdir /fs/ramfs
+
+	if mkfatfs /dev/ram0
+	then
+		if mount -t vfat /dev/ram0 /fs/ramfs
+		then
+			if [ -d /fs/microsd ]
+			then
+				rmdir /fs/microsd
+			fi
+			ln -s /fs/ramfs /fs/microsd
+			set STORAGE_AVAILABLE yes
+			echo "INFO [init] RAM disk at /fs/ramfs (volatile), /fs/microsd is an alias"
+		else
+			echo "ERROR [init] RAM disk mount failed"
+		fi
+	else
+		echo "ERROR [init] RAM disk format failed"
+	fi
+fi

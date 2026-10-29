@@ -1,0 +1,7 @@
+menuconfig SYSTEMCMDS_PWMV2TEST
+	bool "pwmv2test"
+	default n
+	---help---
+		Drive a PWMv2 output on the HPM6E00EVK.  By default it generates a
+		1 kHz, 50% waveform on PWM1 channel 7 (PE15, green LED), which is the
+		simplest way to validate the PWMv2 bring-up without the mixer.

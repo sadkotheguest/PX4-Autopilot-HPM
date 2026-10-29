@@ -33,11 +33,12 @@
 
 px4_add_library(drivers_board
 	init.c
+	led.c
 	bringup_stubs.cpp
 	i2c.cpp
 	mtd.cpp
 	spi.cpp
-	#timer_config.cpp
+	timer_config.cpp
 	#usb.c
 	#sdhc.c
 	#can.c

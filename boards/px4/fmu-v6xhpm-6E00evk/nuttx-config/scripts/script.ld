@@ -17,6 +17,12 @@ MEMORY
     AXI_SRAM (wx) : ORIGIN = 0x01200000, LENGTH = 736K
     NONCACHEABLE_RAM (wx) : ORIGIN = 0x012B8000, LENGTH = 32K
     AHB_SRAM (w) : ORIGIN = 0xF0200000, LENGTH = 32k
+    /* Tail of the 32 MB external SDRAM, used for DMA buffers.  It has to stay
+     * power-of-two sized and aligned: board_init_pmp() turns it into a PMP/PMA
+     * NAPOT region marked non-cacheable.  Keep in sync with the heap size
+     * handed to the allocator in board init.
+     */
+    SDRAM_NC (wx) : ORIGIN = 0x41E00000, LENGTH = 2M
 }
 
 __nor_cfg_option_load_addr__ = ORIGIN(FLASH) + 0x400;
@@ -326,6 +332,21 @@ SECTIONS
 
     __noncacheable_start__ = ORIGIN(NONCACHEABLE_RAM);
     __noncacheable_end__ = ORIGIN(NONCACHEABLE_RAM) + LENGTH(NONCACHEABLE_RAM);
+
+    /* DMA buffers in the external SDRAM.  The window itself is programmed by
+     * __hpm_start() (hpm_sdram_preinit) before anything can access it; the
+     * PMP/PMA entry that makes it non-cacheable is set from board_init_pmp().
+     */
+
+    .sdram_nc (NOLOAD) : {
+        . = ALIGN(64);
+        KEEP(*(.sdram_nc))
+        KEEP(*(.sdram_nc.*))
+        . = ALIGN(64);
+    } > SDRAM_NC
+
+    __sdram_nc_start__ = ORIGIN(SDRAM_NC);
+    __sdram_nc_end__ = ORIGIN(SDRAM_NC) + LENGTH(SDRAM_NC);
 
     /* HPM SDK board.c (board_init_pmp) protects the shared-memory window.
      * This configuration has no shared-memory region, so provide an empty

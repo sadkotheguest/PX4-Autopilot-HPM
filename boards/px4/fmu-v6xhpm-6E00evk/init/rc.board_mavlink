@@ -3,6 +3,12 @@
 # PX4 FMUv6X specific board MAVLink startup script.
 #------------------------------------------------------------------------------
 
+# Ethernet (eth0, ENET0): MAVLink over UDP.  Broadcast mode lets a ground
+# station find the board without knowing its address first; once the GCS sends
+# its first packet the instance continues unicast to it.  -n selects the
+# interface the broadcast address is derived from.
+mavlink start -u 14556 -o 14550 -p -r 4000000 -n eth0
+
 # if skynode base board is detected start Mavlink on Telem2
 # if ver hwbasecmp 009 010 011
 # then

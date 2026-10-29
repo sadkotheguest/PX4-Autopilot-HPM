@@ -113,9 +113,6 @@ CONFIG_HPM_ENABLE_FPU=y
 CONFIG_HPM_PTPC=y
 CONFIG_HPM_BUILD_TYPE_FLASH_XIP=y
 CONFIG_INCLUDE_BOOTHEADER=y
-# CONFIG_HPM_PWM0 is not set
-# CONFIG_HPM_PWM1 is not set
-# CONFIG_HPM_PWM_MULTICHAN is not set
 # CONFIG_HPM_SDXC0 is not set
 # CONFIG_HPM_SPI2 is not set
 # CONFIG_HPM_SPI2_DMA is not set
@@ -135,7 +132,9 @@ CONFIG_LIBC_STRERROR=y
 CONFIG_MEMSET_64BIT=y
 CONFIG_MEMSET_OPTSPEED=y
 CONFIG_MMCSD=y
-CONFIG_MM_REGIONS=2
+# Three heap regions: the main heap, __heap2 (riscv_addregion) and the 32 MB
+# external SDRAM that board_app_initialize() hands to the allocator.
+CONFIG_MM_REGIONS=3
 CONFIG_MTD=y
 CONFIG_MTD_BYTE_WRITE=y
 CONFIG_MTD_PARTITION=y
@@ -206,7 +205,68 @@ CONFIG_HPM_I2C1=y
 CONFIG_HPM_I2C1_MASTER=y
 # CONFIG_HPM_I2C1_DMA is not set
 
+# The EEPROM is the only persistent storage on this board: PX4 puts the
+# parameters and the calibration data on it through its own at24cxx MTD driver
+# (platforms/nuttx/src/px4/common/px4_24xxxx_mtd.c).  That driver reads the
+# CONFIG_AT24XX_SIZE/ADDR values, which NuttX only exports when MTD_AT24XX is
+# enabled; the NuttX driver itself is then compiled but never instantiated.
+CONFIG_MTD_AT24XX=y
+CONFIG_AT24XX_SIZE=128
+CONFIG_AT24XX_ADDR=0x50
+
 # SPI: SPI7 is the only SPI routed on the HPM6E00EVK (PF26/28/29)
 CONFIG_SPI=y
 CONFIG_SPI_DRIVER=y
 CONFIG_HPM_SPI7=y
+
+# PWM: PWMv2 through the PX4 io_timer layer (PWM1 channels 0..3 on PE08..PE11)
+CONFIG_HPM_PWM1=y
+
+# DMA (HDMA): needed by the PWMv2 DShot bring-up (PWM DMA request via TRGM)
+CONFIG_HPM_DMA=y
+
+# Ethernet: ENET0 (RGMII) with the on-board PHY.  Bring-up uses a static
+# address on the bench (192.168.1.20/24, gateway 192.168.1.1) so the link can be
+# verified with ping before PX4/mavlink is put on top of it.
+CONFIG_NET=y
+CONFIG_NET_ARP_IPIN=y
+CONFIG_NET_ARP_SEND=y
+CONFIG_NET_BROADCAST=y
+CONFIG_NET_SOCKOPTS=y
+CONFIG_NET_ICMP=y
+CONFIG_NET_ICMP_SOCKET=y
+CONFIG_NET_UDP=y
+CONFIG_NET_UDP_CHECKSUMS=y
+CONFIG_NET_TCP=y
+CONFIG_NET_ETH_PKTSIZE=1518
+CONFIG_NETDEV_PHY_IOCTL=y
+# The address above is the default for a board on a normal LAN.  For a board
+# cabled directly to a development host that only has an APIPA address, use
+# 169.254.1.1/16 with gateway 169.254.0.1 instead (both ends then share the
+# link-local subnet without touching the host configuration).
+CONFIG_NETINIT_IPADDR=0xC0A80114
+CONFIG_NETINIT_DRIPADDR=0xC0A80101
+CONFIG_NETINIT_NETMASK=0xFFFFFF00
+CONFIG_NETINIT_THREAD=y
+CONFIG_NETINIT_THREAD_PRIORITY=49
+CONFIG_HPM_ENET=y
+CONFIG_HPM_ENET0=y
+CONFIG_HPM_ENET_RGMII=y
+CONFIG_HPM_ENET_LINK_MONITOR=y
+CONFIG_HPM_ENET_LINK_MON_INTERVAL_MS=1000
+CONFIG_HPM_ENET_LOG_LINK=y
+CONFIG_HPM_ENET_LOG_ERROR=y
+# The WARN level logs "dropped frame, unknown ethertype" from the receive path
+# (IPv6 multicast from the host).  syslog from that context deadlocks the PX4
+# console, so it stays off.
+# CONFIG_HPM_ENET_LOG_WARN is not set
+
+# Storage: no SD card controller on the HPM6E80, so the board registers an 8 MB
+# RAM disk (mkrd) that rc.board_storage formats with FAT and mounts at
+# /fs/microsd for dataman and the logger.
+CONFIG_DRVR_MKRD=y
+# Soft links in the pseudo file system: /fs/microsd is an alias for the real
+# RAM-disk volume at /fs/ramfs (PX4 hardcodes the former as its storage path).
+CONFIG_PSEUDOFS_SOFTLINKS=y
+# The 'ln' builtin is needed to create the /fs/microsd alias at boot.
+# CONFIG_NSH_DISABLE_LN is not set

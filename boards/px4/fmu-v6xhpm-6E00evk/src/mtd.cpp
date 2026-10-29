@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- *   Copyright (C) 2020 PX4 Development Team. All rights reserved.
+ *   Copyright (c) 2012-2022 PX4 Development Team. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -31,6 +31,23 @@
  *
  ****************************************************************************/
 
+/**
+ * @file mtd.cpp
+ *
+ * MTD manifest for the HPM6E00EVK.
+ *
+ * The board has no SD card controller and no SPI FRAM, so the only persistent
+ * storage is the CAT24C128 I2C EEPROM on I2C1 (16 KiB, address 0x50).  It is
+ * handed to PX4 as a single MTD device: the first part holds the parameters
+ * (/fs/mtd_params), the rest is reserved for calibration data
+ * (/fs/mtd_caldata).  With CONFIG_AT24XX_SIZE=128 the driver works in
+ * 64-byte pages, i.e. 256 MTD blocks of 64 bytes.
+ */
+
+/****************************************************************************
+ * Included Files
+ ****************************************************************************/
+
 #include <nuttx/config.h>
 #include <board_config.h>
 
@@ -38,83 +55,39 @@
 #include <px4_platform_common/px4_manifest.h>
 
 #if defined(CONFIG_MTD)
-//                                                              KiB BS    nB
-// static const px4_mft_device_t qspi_flash = {             // FM25V02A on FMUM native: 32K X 8, emulated as (1024 Blocks of 32)
-// 	.bus_type = px4_mft_device_t::FLEXSPI,
-// 	.devid    = SPIDEV_FLASH(0)
-// };
-static const px4_mft_device_t spi2 = {             // FM25V02A on FMUM native: 32K X 8, emulated as (1024 Blocks of 32)
-	.bus_type = px4_mft_device_t::SPI,
-	.devid    = SPIDEV_FLASH(0)
-};
-static const px4_mft_device_t i2c0 = {             // 24LC64T on Base  8K 32 X 256
+
+/* CAT24C128 on I2C1: 16 KiB, 256 blocks of 64 bytes. */
+
+static const px4_mft_device_t i2c1_eeprom = {
 	.bus_type = px4_mft_device_t::I2C,
-	.devid    = PX4_MK_I2C_DEVID(0, 0x50)
-};
-static const px4_mft_device_t i2c3 = {             // 24LC64T on IMU   8K 32 X 256
-	.bus_type =  px4_mft_device_t::I2C,
-	.devid    =  PX4_MK_I2C_DEVID(3, 0x50)
+	.devid    = PX4_MK_I2C_DEVID(1, 0x50)
 };
 
-
-static const px4_mtd_entry_t fmum_fram = {
-	.device = &spi2,
-	.npart = 1,
-	.partd = {
-		{
-			.type = MTD_PARAMETERS,
-			.path = "/fs/mtd_params",
-			.nblocks = (32768 / (1 << CONFIG_RAMTRON_EMULATE_SECTOR_SHIFT))
-		}
-	},
-};
-
-static const px4_mtd_entry_t base_eeprom = {
-	.device = &i2c0,
+static const px4_mtd_entry_t eeprom = {
+	.device = &i2c1_eeprom,
 	.npart = 2,
 	.partd = {
 		{
-			.type = MTD_MFT_VER,
-			.path = "/fs/mtd_mft_ver",
-			.nblocks = 248
+			/* 144 blocks = 9 KiB: enough for the full parameter set
+			 * (about 1300 four-byte records) with room to grow.
+			 */
+			.type = MTD_PARAMETERS,
+			.path = "/fs/mtd_params",
+			.nblocks = 144
 		},
 		{
-			.type = MTD_NET,
-			.path = "/fs/mtd_net",
-			.nblocks = 8 // 256 = 32 * 8
-
-		}
-	},
-};
-
-static const px4_mtd_entry_t imu_eeprom = {
-	.device = &i2c3,
-	.npart = 3,
-	.partd = {
-		{
+			/* The remaining 112 blocks (7 KiB) for calibration data. */
 			.type = MTD_CALDATA,
 			.path = "/fs/mtd_caldata",
-			.nblocks = 240
-		},
-		{
-			.type = MTD_MFT_REV,
-			.path = "/fs/mtd_mft_rev",
-			.nblocks = 8
-		},
-		{
-			.type = MTD_ID,
-			.path = "/fs/mtd_id",
-			.nblocks = 8 // 256 = 32 * 8
+			.nblocks = 112
 		}
 	},
 };
 
 static const px4_mtd_manifest_t board_mtd_config = {
-	.nconfigs   = 3,
+	.nconfigs   = 1,
 	.entries = {
-		&fmum_fram,
-		&base_eeprom,
-		&imu_eeprom
+		&eeprom
 	}
 };
 
@@ -126,7 +99,7 @@ static const px4_mft_entry_s mtd_mft = {
 static const px4_mft_entry_s mft_mft = {
 	.type = MFT,
 #ifdef BOARD_HAS_HW_SPLIT_VERSIONING
-	.pmft = (void *)system_query_manifest ,//system_query_manifest,待完善
+	.pmft = (void *)system_query_manifest,
 #else
 	.pmft = (void *)NULL,
 #endif
