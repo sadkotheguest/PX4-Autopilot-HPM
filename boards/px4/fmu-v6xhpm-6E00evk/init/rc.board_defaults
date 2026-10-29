@@ -30,3 +30,7 @@ safety_button start
 # disk, so the logger would refuse to start (it wants 50 MiB free).  Stream
 # the logs to the ground station over MAVLink (Ethernet) instead.
 set LOGGER_ARGS "-m mavlink"
+
+# HPM6E80 on-die temperature sensor: published as debug_key_value ("SOC_TEMP"),
+# which the logger records and MAVLink streams as NAMED_VALUE_FLOAT.
+hpm_tsns start

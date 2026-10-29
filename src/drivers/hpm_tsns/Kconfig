@@ -1,0 +1,9 @@
+menuconfig DRIVERS_HPM_TSNS
+	bool "hpm_tsns"
+	default n
+	---help---
+		Driver for the HPM6E80 on-die temperature sensor (TSNS).
+
+		The die temperature is published once per second through the
+		debug_key_value topic with the key "SOC_TEMP".  The logger records it
+		and MAVLink forwards it to the ground station as NAMED_VALUE_FLOAT.
