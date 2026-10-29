@@ -144,6 +144,27 @@ static uint32_t dshot_cmp(bool bit)
 	return reload - duty;
 }
 
+/* Compare value of the DMA request point: early in the counter period, just
+ * after the reload.  The counter counts down from `reload`, so a compare value
+ * of `reload - reload/8` fires one eighth of a period after the reload, which
+ * leaves ~7/8 of the period for the shadow write to land before the next reload
+ * latches it into the comparator.  A mid-period point (reload/2) leaves only
+ * half a period and made the first bits of a frame VULNERABLE to bus contention:
+ * a write that missed the latch repeated the previous bit and produced an extra
+ * pulse at the frame start.
+ */
+static uint32_t dshot_dma_request_point(void)
+{
+	uint32_t point = reload - (reload / 8u);
+
+	/* keep a few ticks of separation from the reload itself */
+	if ((reload > 8u) && (point > (reload - 4u))) {
+		point = reload - 4u;
+	}
+
+	return point;
+}
+
 static void dshot_build_channel(unsigned channel)
 {
 	if (channel >= num_channels) {
@@ -247,15 +268,19 @@ static void dshot_pwm_init(void)
 	pwmv2_set_shadow_val(pwm, sh_period, reload, 0, false);
 	pwmv2_set_shadow_val(pwm, sh_edge, reload + 1, 0, false);
 
-	/* Trigger comparator for the DMA request: a constant point late in the
-	 * period, AFTER the pulse, so the duty shadow written by the DMA is applied
-	 * well before the next reload latches it (no race with the latch).
+	/* Trigger comparator for the DMA request.  The point sits EARLY in the counter
+	 * period (just after the reload), not in the middle: every duty-shadow write
+	 * has to reach the shadow before the next reload latches it, and under bus
+	 * contention a half-period window was not always enough - a write that missed
+	 * its deadline repeated the previous bit on the wire and produced an extra
+	 * pulse at the frame start.  Early request leaves ~7/8 of the period.
 	 */
 	const uint8_t sh_dma_trig = PWMV2_SHADOW_INDEX(4);
-	pwmv2_set_shadow_val(pwm, sh_dma_trig, reload / 2u, 0, false);
+	const uint32_t request_point = dshot_dma_request_point();
+	pwmv2_set_shadow_val(pwm, sh_dma_trig, request_point, 0, false);
 
 	pwmv2_cmp_config_t cmp_trig = {};
-	cmp_trig.cmp = reload / 2u;
+	cmp_trig.cmp = request_point;
 	cmp_trig.cmp_source = cmp_value_from_shadow_val;
 	cmp_trig.cmp_source_index = sh_dma_trig;
 	cmp_trig.update_trigger = pwm_shadow_register_update_on_reload;
@@ -471,10 +496,11 @@ void up_dshot_trigger(void)
 	 * not fire before that.  Prime the frame just past the compare request point,
 	 * with a margin so the request line has definitely dropped before the channel
 	 * is enabled; the first period then stays idle and the frame starts on the
-	 * next one.  (Priming right after the reload instead was measured to produce
-	 * an extra edge on ~50 % of the frames - see BDSHOT_PLAN.md.)
+	 * next one, with almost a whole period between each write and its latch.
+	 * (Priming right after the reload instead was measured to produce an extra
+	 * edge on ~50 % of the frames - see BDSHOT_PLAN.md.)
 	 */
-	const uint32_t request_point = reload / 2u;
+	const uint32_t request_point = dshot_dma_request_point();
 	const uint32_t margin = (reload / 32u) + 1u;
 	const uint32_t limit = (request_point > margin) ? (request_point - margin) : 0u;
 

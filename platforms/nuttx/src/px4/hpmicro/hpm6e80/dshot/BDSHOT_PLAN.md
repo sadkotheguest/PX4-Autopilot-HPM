@@ -846,17 +846,45 @@ first bit.  Second, the extra measurement is accompanied by period warps that
 cancel out: a long period of 229 (bit + 63) after it and short periods of 104
 (bit - 62) later, i.e. `229 + 104 = 2 x 166.5`.  The pulse train therefore keeps
 its total length - the extra edge is inserted inside the frame and the following
-measurements re-sync, which is the signature of a capture-side artefact rather
-than an extra pulse on the wire (an extra pulse would have lengthened the whole
-frame).
+measurements re-sync, which is the signature of a write that missed its latch
+deadline rather than of an extra word in the chain.
 
-The `mcycle`-based duration in that run was too noisy to be conclusive
-(reference 143..371 tenths of a bit - the monitor loop's break conditions and
-the trigger-to-first-edge lag vary), so the TX-side half of the classification
-is not proven yet.  Next step: use the transmit chain end as the timing
-reference (`HPM_HDMA->CHEN` clears when the 17-word chain finishes) - it is
-independent of the receiver, so "same transmitter window, one more capture
-event" would settle the question.
+### Reopened cause and fix: the DMA request point sat mid-period
+
+The detector's own tight polling made the event much more frequent (2 detections
+in ~25 frames, while the same rate was 1000/1000 clean without monitoring), which
+identified it as a timing race sensitive to bus load - and a real aircraft loads
+the bus far more than this bench does.
+
+Mechanism: the compare request that feeds the duty shadow fired in the MIDDLE of
+the counter period, so each shadow write had only half a period to reach the
+shadow before the next reload latched it.  Under bus contention the write could
+miss that deadline, the comparator kept the previous value for one more period
+and the wire carried a repeated bit plus a duplicated pulse at the frame start -
+exactly the `125,125` pair at the beginning of the dump above, with the frame
+total length unchanged and the bit count off by one.
+
+Fix: `dshot_dma_request_point()` moves the request to `reload - reload/8`, i.e.
+one eighth of a period after the reload, which leaves ~7/8 of the period for the
+write to land.  Same function feeds the shadow value, the comparator and the
+frame priming wait, so the three cannot drift apart.
+
+Measured after the fix (`gcapxdet` is the stress test because it keeps the CPU
+polling the DMA destination pointer in a tight loop):
+
+- `gcapxdet 600 50 1000` twice -> 1000/1000 and 1000/1000 matches, detected=0
+  (before the fix the same command detected the event at frame 23);
+- `gcapxdet 300 50 1000` -> 1000/1000, detected=0;
+- `gcapxev 150 50 5 600` (the deterministic first-bit repro) -> 5/5 MATCH;
+- `gcapxsweep 5` -> 105/105; `gcapxloop 600 50 300` -> 300/300;
+- `gcapxtimeout` both cases OK; `gcapx 600 50` MATCH; `pollscan 150 50` after a
+  600 kbit/s frame -> 16 bits / 32 edges.
+
+The `gcapxdet` duration classifier itself is still noisy (reference spread from
+21 to 902 tenths of a bit between runs), so it is not used for the verdict here;
+the detection count is what was measured.  If the residual ever comes back, the
+next step is the HDMA-chain-end reference (`HPM_HDMA->CHEN` clearing) as an
+independent transmitter window.
 
 `gcapxev` stays in `pwmv2test` because it reproduces the older variants of this
-on demand; `gcapxdet` is the one to extend when this is picked up again.
+on demand; `gcapxdet` is the stress test for this class of timing races.
