@@ -54,6 +54,7 @@
 #include <uORB/topics/debug_key_value.h>
 
 #include "hpm_clock_drv.h"
+#include "hpm_otp_table.h"
 #include "hpm_soc.h"
 #include "hpm_tsns_drv.h"
 
@@ -62,6 +63,34 @@ namespace
 constexpr const char kDebugKey[] = "SOC_TEMP";
 constexpr uint32_t kIntervalUs = 1000000;   /* one sample per second */
 constexpr float kTempScale = 256.0f;        /* TSNS_TEMP_SCALE */
+
+/* Factory calibration of the sensor lives in OTP word 21: a 12-bit base offset
+ * in bits [11:0], a 12-bit slope in bits [23:12] and one enable bit for each.
+ * When both enable bits are set the TSNS hardware applies the correction to the
+ * value it reports in TSNS_Type.T itself, so the driver only reads T - the point
+ * of checking the word is to know whether that value can be trusted.
+ */
+
+struct TsnsCalibration {
+	uint16_t base;
+	uint16_t slope;
+	bool base_enabled;
+	bool slope_enabled;
+	bool factory_calibrated() const { return base_enabled && slope_enabled; }
+};
+
+TsnsCalibration read_calibration()
+{
+	const uint32_t word = HPM_OTP->SHADOW[OTP_TABLE_TSNS_BASE_OFFSET];
+
+	TsnsCalibration calibration{};
+	calibration.base = OTP_TABLE_TSNS_BASE_GET(word);
+	calibration.slope = OTP_TABLE_TSNS_SLOPE_GET(word);
+	calibration.base_enabled = OTP_TABLE_TSNS_BASE_EN_GET(word);
+	calibration.slope_enabled = OTP_TABLE_TSNS_SLOPE_EN_GET(word);
+
+	return calibration;
+}
 
 bool read_temperature(float &temperature)
 {
@@ -96,6 +125,8 @@ private:
 	void Run() override;
 
 	uORB::Publication<debug_key_value_s> _debug_key_value_pub{ORB_ID(debug_key_value)};
+
+	TsnsCalibration _calibration{};
 };
 
 int HpmTsns::init()
@@ -108,6 +139,18 @@ int HpmTsns::init()
 	/* The block powers up in trigger mode, where a conversion only happens when
 	 * asked for; continuous mode lets it sample on its own. */
 	tsns_enable_continuous_mode(HPM_TSNS);
+
+	_calibration = read_calibration();
+
+	if (_calibration.factory_calibrated()) {
+		PX4_INFO("TSNS: factory calibration from OTP (base 0x%03x, slope 0x%03x), applied by the sensor",
+			 	 _calibration.base, _calibration.slope);
+
+	} else {
+		PX4_WARN("TSNS: OTP calibration not enabled (base 0x%03x/%d, slope 0x%03x/%d); reading is uncalibrated",
+					 _calibration.base, (int)_calibration.base_enabled,
+					 _calibration.slope, (int)_calibration.slope_enabled);
+	}
 
 	ScheduleOnInterval(kIntervalUs, kIntervalUs);
 
@@ -143,7 +186,10 @@ int HpmTsns::print_status()
 	float current;
 
 	if (read_temperature(current)) {
-		PX4_INFO("TSNS: now %.2f degC, min %.2f, max %.2f", (double)current, (double)min, (double)max);
+		PX4_INFO("TSNS: now %.2f degC, min %.2f, max %.2f, OTP cal %s (base 0x%03x slope 0x%03x)",
+			  (double)current, (double)min, (double)max,
+			  _calibration.factory_calibrated() ? "enabled" : "off",
+			  _calibration.base, _calibration.slope);
 
 	} else {
 		PX4_WARN("TSNS: temperature not valid yet (min %.2f, max %.2f)", (double)min, (double)max);
